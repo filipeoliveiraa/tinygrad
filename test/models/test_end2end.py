@@ -2,60 +2,60 @@ import torch
 from torch import nn
 import unittest
 import numpy as np
-from tinygrad.state import get_parameters, get_state_dict
+from tinygrad.nn.state import get_parameters, get_state_dict
 from tinygrad.nn import optim, Linear, Conv2d, BatchNorm2d
 from tinygrad.tensor import Tensor
 from extra.datasets import fetch_mnist
 from tinygrad.helpers import CI
 
 def compare_tiny_torch(model, model_torch, X, Y):
-  Tensor.training = True
-  model_torch.train()
-  model_state_dict = get_state_dict(model)
-  for k,v in model_torch.named_parameters():
-    if not CI: print(f"initting {k} from torch")
-    model_state_dict[k].assign(Tensor(v.detach().numpy())).realize()
+  with Tensor.train():
+    model_torch.train()
+    model_state_dict = get_state_dict(model)
+    for k,v in model_torch.named_parameters():
+      if not CI: print(f"initting {k} from torch")
+      model_state_dict[k].assign(Tensor(v.detach().numpy())).realize()
 
-  optimizer = optim.SGD(get_parameters(model), lr=0.01)
-  optimizer_torch = torch.optim.SGD(model_torch.parameters(), lr=0.01)
+    optimizer = optim.SGD(get_parameters(model), lr=0.001)
+    optimizer_torch = torch.optim.SGD(model_torch.parameters(), lr=0.001)
 
-  Xt = torch.Tensor(X.numpy())
-  np.testing.assert_allclose(X.numpy(), Xt.detach().numpy())
+    Xt = torch.Tensor(X.numpy())
+    np.testing.assert_allclose(X.numpy(), Xt.detach().numpy())
 
-  out = model(X)
-  loss = (out * Y).mean()
-  if not CI: print(loss.realize().numpy())
+    out = model(X)
+    loss = (out * Y).mean()
 
-  out_torch = model_torch(torch.Tensor(X.numpy()))
-  loss_torch = (out_torch * torch.Tensor(Y.numpy())).mean()
-  if not CI: print(loss_torch.detach().numpy())
+    out_torch = model_torch(torch.Tensor(X.numpy()))
+    loss_torch = (out_torch * torch.Tensor(Y.numpy())).mean()
 
-  # assert losses match
-  np.testing.assert_allclose(loss.realize().numpy(), loss_torch.detach().numpy(), atol=1e-4)
+    # zero and backward
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer_torch.zero_grad()
+    loss_torch.backward()
 
-  # zero and backward
-  optimizer.zero_grad()
-  loss.backward()
-  optimizer_torch.zero_grad()
-  loss_torch.backward()
+    # assert losses match
+    if not CI: print(loss.realize().numpy())
+    if not CI: print(loss_torch.detach().numpy())
+    np.testing.assert_allclose(loss.realize().numpy(), loss_torch.detach().numpy(), atol=1e-4)
 
-  for k,v in list(model_torch.named_parameters())[::-1]:
-    g = model_state_dict[k].grad.numpy()
-    gt = v.grad.detach().numpy()
-    if not CI: print("testing grads", k)
-    np.testing.assert_allclose(g, gt, atol=1e-3, err_msg=f'grad mismatch {k}')
+    for k,v in list(model_torch.named_parameters())[::-1]:
+      g = model_state_dict[k].grad.numpy()
+      gt = v.grad.detach().numpy()
+      if not CI: print("testing grads", k, model_state_dict[k].grad.dtype)
+      np.testing.assert_allclose(g, gt, atol=1e-3, err_msg=f'grad mismatch {k}')
 
-  # take the steps
-  optimizer.step()
-  optimizer_torch.step()
+    # take the steps
+    optimizer.step()
+    optimizer_torch.step()
 
-  # assert weights match (they don't!)
-  for k,v in model_torch.named_parameters():
-    if not CI: print("testing weight", k)
-    np.testing.assert_allclose(model_state_dict[k].numpy(), v.detach().numpy(), atol=1e-3, err_msg=f'weight mismatch {k}')
+    # assert weights match
+    for k,v in model_torch.named_parameters():
+      if not CI: print("testing weight", k, model_state_dict[k].dtype)
+      np.testing.assert_allclose(model_state_dict[k].numpy(), v.detach().numpy(), atol=1e-3, err_msg=f'weight mismatch {k}')
 
 def get_mnist_data():
-  X_train, Y_train, X_test, Y_test = fetch_mnist()
+  _X_train, _Y_train, X_test, Y_test = fetch_mnist()
   BS = 32
   num_classes = 10
   X = Tensor(X_test[0:BS].astype(np.float32))
@@ -68,21 +68,23 @@ class TestEnd2End(unittest.TestCase):
   def setUpClass(cls):
     cls.X, cls.Y = get_mnist_data()
 
+  def setUp(self):
+    torch.manual_seed(123)
+
   def test_linear_mnist(self):
     class LinTiny:
-      def __init__(self, has_batchnorm=False):
-        self.l1 = Linear(784, 128)
-        self.l2 = Linear(128, 10)
-        self.bn1 = BatchNorm2d(128) if has_batchnorm else lambda x: x
+      def __init__(self, bias=False):
+        self.l1 = Linear(784, 128, bias=bias)
+        self.l2 = Linear(128, 10, bias=bias)
       def __call__(self, x):
-        return self.l2(self.l1(x)).relu().log_softmax(-1)
+        return self.l2(self.l1(x).relu()).log_softmax(-1)
     class LinTorch(nn.Module):
-      def __init__(self, has_batchnorm=False):
+      def __init__(self, bias=False):
         super().__init__()
-        self.l1 = nn.Linear(784, 128)
-        self.l2 = nn.Linear(128, 10)
+        self.l1 = nn.Linear(784, 128, bias=bias)
+        self.l2 = nn.Linear(128, 10, bias=bias)
       def forward(self, x):
-        return self.l2(self.l1(x)).relu().log_softmax(-1)
+        return self.l2(self.l1(x).relu()).log_softmax(-1)
     compare_tiny_torch(LinTiny(), LinTorch(), self.X, self.Y)
 
   def test_bn_mnist(self):

@@ -1,109 +1,73 @@
-from models.efficientnet import EfficientNet
+from pathlib import Path
+from extra.models.efficientnet import EfficientNet
 from tinygrad.tensor import Tensor
-from tinygrad.jit import TinyJit
-from extra.utils import fetch
+from tinygrad.nn.state import get_state_dict, safe_save, safe_load, load_state_dict
+from extra.export_model import export_model
+from tinygrad.helpers import getenv, fetch
 import ast
-
-def compile_net(run, special_names):
-  functions, bufs, bufs_to_save, statements, bufnum = {}, {}, {}, [], 0
-  for fxn,args in run.jit_cache:
-    functions[fxn.name] = fxn.prg   # NOTE: this assumes all with the same name are the same
-    cargs = []
-    for i,arg in enumerate(args):
-      key = id(arg)
-      if key not in bufs:
-        if key in special_names:
-          bufs[key] = (special_names[key], arg._memsz, key)
-        else:
-          bufs[key] = (f"buf_{bufnum}", arg._memsz, key)
-          bufnum += 1
-          if i > 0: bufs_to_save[bufs[key][0]] = arg   # if first usage of a buffer is not an output, and it's not a special name
-      cargs.append(bufs[key][0])
-    statements.append((fxn.name, cargs, fxn.global_size))
-
-  return functions, statements, bufs, bufs_to_save
-
-def jit_model(model, the_input):
-  @TinyJit
-  def run(x): return model.forward(x).realize()
-
-  # twice to run the JIT
-  the_output = run(the_input)
-  the_output = run(the_input)
-
-  # hack to put the inputs back
-  assert len(run.input_replace) == 1, f"didn't get one input to replace {run.input_replace}"
-  for (j,i),idx in run.input_replace.items():
-    run.jit_cache[j][1][i] = the_input.lazydata.realized
-
-  # TODO: fetch this from the jit in self.input_replace and self.ret (hint: use get_parameters on self.ret)
-  special_names = {id(the_input.lazydata.realized): "input", id(the_output.lazydata.realized): "outputs"}
-  return run, special_names
 
 if __name__ == "__main__":
   model = EfficientNet(0)
   model.load_from_pretrained()
-  run, special_names = jit_model(model, Tensor.randn(1,3,224,224))
-  functions, statements, bufs, bufs_to_save = compile_net(run, special_names)
+  dirname = Path(__file__).parent
+  # exporting a model that's loaded from safetensors doesn't work without loading in from safetensors first
+  # loading the state dict from a safetensor file changes the generated kernels
+  if getenv("WEBGPU"):
+    safe_save(get_state_dict(model), (dirname / "net.safetensors").as_posix())
+    load_state_dict(model, safe_load(str(dirname / "net.safetensors")))
+  mode = "clang" if getenv("CPU", "") != "" else "webgpu" if getenv("WEBGPU", "") != "" else ""
+  prg, inp_sizes, out_sizes, state = export_model(model, mode, Tensor.randn(1,3,224,224))
+  if getenv("CPU", "") == "":
+    ext = "js" if getenv("WEBGPU", "") != "" else "json"
+    with open(dirname / f"net.{ext}", "w") as text_file:
+      text_file.write(prg)
+  else:
+    cprog = [prg]
+    # image library!
+    cprog += ["#define STB_IMAGE_IMPLEMENTATION", fetch("https://raw.githubusercontent.com/nothings/stb/master/stb_image.h").read_text().replace("half", "_half")]
 
-  # c header
-  cprog = ["#include <stdio.h>", "#include <math.h>", "#define max(x,y) ((x>y)?x:y)"]
+    # imagenet labels, move to datasets?
+    lbls = ast.literal_eval(fetch("https://gist.githubusercontent.com/yrevar/942d3a0ac09ec9e5eb3a/raw/238f720ff059c1f82f368259d1ca4ffa5dd8f9f5/imagenet1000_clsidx_to_labels.txt").read_text())
+    lbls = ['"'+lbls[i]+'"' for i in range(1000)]
+    inputs = "\n".join([f"float {inp}[{inp_size}];" for inp,inp_size in inp_sizes.items()])
+    outputs = "\n".join([f"float {out}[{out_size}];" for out,out_size in out_sizes.items()])
+    cprog.append(f"char *lbls[] = {{{','.join(lbls)}}};")
+    cprog.append(inputs)
+    cprog.append(outputs)
 
-  # save the weights
-  for name,cl in bufs_to_save.items():
-    weight = ''.join(["\\x%02X"%x for x in bytes(cl._buf)])
-    cprog.append(f"unsigned char {name}_data[] = \"{weight}\";")
-
-  # image library!
-  cprog += ["#define STB_IMAGE_IMPLEMENTATION", fetch("https://raw.githubusercontent.com/nothings/stb/master/stb_image.h").decode('utf-8')]
-
-  # imagenet labels, move to datasets?
-  lbls = fetch("https://gist.githubusercontent.com/yrevar/942d3a0ac09ec9e5eb3a/raw/238f720ff059c1f82f368259d1ca4ffa5dd8f9f5/imagenet1000_clsidx_to_labels.txt")
-  lbls = ast.literal_eval(lbls.decode('utf-8'))
-  lbls = ['"'+lbls[i]+'"' for i in range(1000)]
-  cprog.append(f"char *lbls[] = {{{','.join(lbls)}}};")
-
-  # buffers (empty + weights)
-  cprog += [f"float {name}[{len}];" if name not in bufs_to_save else f"float *{name} = (float *){name}_data;" for name,len,_key in bufs.values()]
-
-  # the functions
-  cprog += list(functions.values())
-
-  # the net
-  cprog += ["void net() {"] + [f"{name}({', '.join(args)});" for (name, args, _global_size) in statements] + ["}"]
-
-  cprog += ["""
-int main(int argc, char* argv[]) {
-  int DEBUG = getenv("DEBUG") != NULL ? atoi(getenv("DEBUG")) : 0;
-  int X=0, Y=0, chan=0;
-  stbi_uc *image = (argc > 1) ? stbi_load(argv[1], &X, &Y, &chan, 3) : stbi_load_from_file(stdin, &X, &Y, &chan, 3);
-  assert(image != NULL);
-  if (DEBUG) printf("loaded image %dx%d channels %d\\n", X, Y, chan);
-  assert(chan == 3);
-  // resize to input[1,3,224,224] and rescale
-  for (int y = 0; y < 224; y++) {
-    for (int x = 0; x < 224; x++) {
-      // get sample position
-      int tx = (x/224.)*X;
-      int ty = (y/224.)*Y;
-      for (int c = 0; c < 3; c++) {
-        input[c*224*224 + y*224 + x] = (image[ty*X*chan + tx*chan + c] / 255.0 - 0.45) / 0.225;
+    # buffers (empty + weights)
+    cprog.append("""
+  int main(int argc, char* argv[]) {
+    int DEBUG = getenv("DEBUG") != NULL ? atoi(getenv("DEBUG")) : 0;
+    int X=0, Y=0, chan=0;
+    stbi_uc *image = (argc > 1) ? stbi_load(argv[1], &X, &Y, &chan, 3) : stbi_load_from_file(stdin, &X, &Y, &chan, 3);
+    assert(image != NULL);
+    if (DEBUG) printf("loaded image %dx%d channels %d\\n", X, Y, chan);
+    assert(chan == 3);
+    // resize to input[1,3,224,224] and rescale
+    for (int y = 0; y < 224; y++) {
+      for (int x = 0; x < 224; x++) {
+        // get sample position
+        int tx = (x/224.)*X;
+        int ty = (y/224.)*Y;
+        for (int c = 0; c < 3; c++) {
+          input0[c*224*224 + y*224 + x] = (image[ty*X*chan + tx*chan + c] / 255.0 - 0.45) / 0.225;
+        }
       }
     }
-  }
-  net();
-  float best = -INFINITY;
-  int best_idx = -1;
-  for (int i = 0; i < 1000; i++) {
-    if (outputs[i] > best) {
-      best = outputs[i];
-      best_idx = i;
+    net(input0, output0);
+    float best = -INFINITY;
+    int best_idx = -1;
+    for (int i = 0; i < 1000; i++) {
+      if (output0[i] > best) {
+        best = output0[i];
+        best_idx = i;
+      }
     }
-  }
-  if (DEBUG) printf("category : %d (%s) with %f\\n", best_idx, lbls[best_idx], best);
-  else printf("%s\\n", lbls[best_idx]);
-}"""]
+    if (DEBUG) printf("category : %d (%s) with %f\\n", best_idx, lbls[best_idx], best);
+    else printf("%s\\n", lbls[best_idx]);
+  }""")
 
-  # CLANG=1 python3 examples/compile_efficientnet.py | clang -O2 -lm -x c - -o recognize && DEBUG=1 time ./recognize docs/showcase/stable_diffusion_by_tinygrad.jpg
-  # category : 281 (tabby, tabby cat) with 9.452788
-  print('\n'.join(cprog))
+    # CPU=1 python3 examples/compile_efficientnet.py | clang -O2 -lm -x c - -o recognize && DEBUG=1 time ./recognize docs/showcase/stable_diffusion_by_tinygrad.jpg
+    # category : 281 (tabby, tabby cat) with 9.452788
+    print('\n'.join(cprog))

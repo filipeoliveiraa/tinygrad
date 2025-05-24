@@ -1,15 +1,16 @@
 import unittest
+from typing import Any, Tuple
 from onnx.backend.base import Backend, BackendRep
 import onnx.backend.test
 import numpy as np
-from tinygrad.tensor import Tensor
-from typing import Any, Tuple
-from tinygrad.helpers import getenv
+from tinygrad import Tensor, Device, dtypes
+from tinygrad.helpers import getenv, OSX
+from tinygrad.device import is_dtype_supported
 
 # pip3 install tabulate
 pytest_plugins = 'onnx.backend.test.report',
 
-from extra.onnx import get_run_onnx
+from tinygrad.frontend.onnx import OnnxRunner
 
 class TinygradModel(BackendRep):
   def __init__(self, run_onnx, input_names):
@@ -18,9 +19,9 @@ class TinygradModel(BackendRep):
     self.input_names = input_names
 
   def run(self, inputs: Any, **kwargs: Any) -> Tuple[Any, ...]:
-    real_inputs = {k:v for k,v in zip(self.input_names, inputs)}
-    ret = self.fxn(real_inputs, debug=True)
-    return tuple(x.numpy() if isinstance(x, Tensor) else np.array(x) for x in ret.values())
+    real_inputs = dict(zip(self.input_names, inputs))
+    ret = self.fxn(real_inputs, debug=2)
+    return tuple(x.numpy() if isinstance(x, Tensor) else [i.numpy() for i in x] if isinstance(x, list) else np.array(x) for x in ret.values())
 
 class TinygradBackend(Backend):
   @classmethod
@@ -29,84 +30,99 @@ class TinygradBackend(Backend):
     input_initializer = [x.name for x in model.graph.initializer]
     net_feed_input = [x for x in input_all if x not in input_initializer]
     print("prepare", cls, device, net_feed_input)
-    run_onnx = get_run_onnx(model)
+    run_onnx = OnnxRunner(model)
     return TinygradModel(run_onnx, net_feed_input)
 
   @classmethod
   def supports_device(cls, device: str) -> bool:
+    # NOTE: this is onnx CPU
     return device == "CPU"
 
 backend_test = onnx.backend.test.BackendTest(TinygradBackend, __name__)
 
-# add support for SoftmaxCrossEntropyLoss and NegativeLogLikelihoodLoss
-backend_test.exclude('test_sce_*')
+# BUG: buggy onnx tests
+backend_test.exclude('test_adam_multiple_cpu')
 
-# no support for reduce with multiply (needs llop)
-backend_test.exclude('test_reduce_prod_*')
+# BUG: ORT fails these with runtime error
+backend_test.exclude('test_PReLU_1d_multiparam_cpu')
+backend_test.exclude('test_PReLU_2d_multiparam_cpu')
+backend_test.exclude('test_PReLU_3d_multiparam_cpu')
 
-# no optimizers (add them?)
-backend_test.exclude('test_adagrad_*')
-backend_test.exclude('test_adam_*')
-backend_test.exclude('test_nesterov_momentum_*')
-backend_test.exclude('test_momentum_*')
+# BUG: we don't match ORT here due to some div inaccuracy with floats
+backend_test.exclude('test_dynamicquantizelinear_cpu')
+backend_test.exclude('test_dynamicquantizelinear_expanded_cpu')
 
-# disable some creation ops
-backend_test.exclude('test_eyelike_*')
+# BUG: ORT fails these with numerical error but we match ORT numerically
+# tested in external_test_onnx_ops.py::TestMainOnnxOps.test_qlinearmatmul_2D_int8_float16
+backend_test.exclude('test_qlinearmatmul_2D_int8_float16_cpu')
+# tested in external_test_onnx_ops.py::TestMainOnnxOps.test_qlinearmatmul_3D_int8_float16
+backend_test.exclude('test_qlinearmatmul_3D_int8_float16_cpu')
+# tested in external_test_onnx_ops.py::TestMainOnnxOps.test_qlinearmatmul_2D_int8_float32
+backend_test.exclude('test_qlinearmatmul_2D_int8_float32_cpu')
+# tested in external_test_onnx_ops.py::TestMainOnnxOps.test_qlinearmatmul_3D_int8_float32
+backend_test.exclude('test_qlinearmatmul_3D_int8_float32_cpu')
+# tested in external_test_onnx_ops.py::TestMainOnnxOps.test_maxunpool_export_with_output_shape
+backend_test.exclude('test_maxunpool_export_with_output_shape_cpu')
+# tested in external_test_onnx_ops.py::TestMainOnnxOps.test_averagepool_3d_dilations_large_count_include_pad_is_1_ceil_mode_is_True
+backend_test.exclude('test_averagepool_3d_dilations_large_count_include_pad_is_1_ceil_mode_is_True_cpu')
 
-# we only support float32
-backend_test.exclude('uint8')
-backend_test.exclude('uint16')
-backend_test.exclude('uint32')
-backend_test.exclude('uint64')
-backend_test.exclude('int8')
-backend_test.exclude('int16')
-backend_test.exclude('float64')
-backend_test.exclude('string')
+# about different dtypes
+if not is_dtype_supported(dtypes.float64):
+  backend_test.exclude('float64')
+  backend_test.exclude('DOUBLE')
+  # these have float64 inputs
+  backend_test.exclude('test_eyelike_with_dtype_cpu')
+  backend_test.exclude('test_reduce_log_sum_exp*')
+  backend_test.exclude('test_operator_add*')
+  backend_test.exclude('test_einsum_*')
+  backend_test.exclude('test_cumsum_*')
 
-backend_test.exclude('test_pow_types_int*')
-backend_test.exclude('test_cast_*')
-backend_test.exclude('test_castlike_*')
-backend_test.exclude('test_convinteger_*')
-backend_test.exclude('test_matmulinteger_*')
+if not is_dtype_supported(dtypes.float16):
+  backend_test.exclude('float16')
+  backend_test.exclude('FLOAT16')
 
-# we don't support rounding
-backend_test.exclude('test_round_*')
+# dtype cast
+backend_test.exclude('STRING')
+backend_test.exclude('FLOAT8')
+backend_test.exclude('INT4')
+backend_test.exclude('UINT4')
+backend_test.exclude('BFLOAT16')  # not supported in numpy
+# TODO: fix these with true onnx float16
+backend_test.exclude('to_FLOAT16')
+backend_test.exclude('cast_no_saturate')
+backend_test.exclude('test_dequantizelinear_e4m3fn_float16_cpu')
+backend_test.exclude('test_max_float16_cpu')
+backend_test.exclude('test_min_float16_cpu')
+backend_test.exclude('test_mod_mixed_sign_float16_cpu')
+
+backend_test.exclude('test_dequantizelinear_int4_cpu')
+backend_test.exclude('test_dequantizelinear_uint4_cpu')
+backend_test.exclude('test_quantizelinear_int4_cpu')
+backend_test.exclude('test_quantizelinear_uint4_cpu')
+
+# no support for FLOAT8
+backend_test.exclude('test_quantizelinear_e4m3fn_cpu')
+backend_test.exclude('test_quantizelinear_e5m2_cpu')
+backend_test.exclude('test_quantizelinear_e4m3fn_cpu')
+backend_test.exclude('test_quantizelinear_e5m2_cpu')
+backend_test.exclude('test_dequantizelinear_e4m3fn_cpu')
+backend_test.exclude('test_dequantizelinear_e4m3fn_zero_point_cpu')
+backend_test.exclude('test_dequantizelinear_e5m2_cpu')
 
 # we don't support indexes
-backend_test.exclude('test_argmax_*')
-backend_test.exclude('test_argmin_*')
 backend_test.exclude('test_nonzero_*')
 
-# no support for nan or inf
-backend_test.exclude('test_isinf_*')
-backend_test.exclude('test_isnan_*')
-
-# no support for mod
-backend_test.exclude('test_mod_*')
-
-# no trig ops
-backend_test.exclude('test_acos_*')
-backend_test.exclude('test_acosh_*')
-backend_test.exclude('test_asin_*')
-backend_test.exclude('test_asinh_*')
-backend_test.exclude('test_atan_*')
-backend_test.exclude('test_atanh_*')
+# no support for int pow
+backend_test.exclude('test_pow_types_int32_int32_cpu')
+backend_test.exclude('test_pow_types_int64_int64_cpu')
 
 # no boolean ops (2d, 3d, 4d)
 backend_test.exclude('test_bitshift_*')
 
-# no scatter gather
-backend_test.exclude('test_gather_*')
-backend_test.exclude('test_gathernd_*')
-backend_test.exclude('test_scatter_*')
-backend_test.exclude('test_scatternd_*')
-
-# no quantize
-backend_test.exclude('test_dequantizelinear_*')
-backend_test.exclude('test_dynamicquantizelinear_*')
-backend_test.exclude('test_qlinearmatmul_*')
-backend_test.exclude('test_qlinearconv_*')
-backend_test.exclude('test_quantizelinear_*')
+# no string ops
+backend_test.exclude('string')
+backend_test.exclude('test_strnorm_*')
+backend_test.exclude('test_regex_*')
 
 # no rnn
 backend_test.exclude('test_gru_*')
@@ -115,49 +131,71 @@ backend_test.exclude('test_lstm_*')
 backend_test.exclude('test_simple_rnn_*')
 
 # no control flow
+# control flow uses AttributeProto.GRAPH
 backend_test.exclude('test_if_*')
 backend_test.exclude('test_loop*')
+backend_test.exclude('test_range_float_type_positive_delta_expanded_cpu') # requires loop
+backend_test.exclude('test_affine_grid_2d_align_corners_expanded_cpu')
+backend_test.exclude('test_affine_grid_2d_expanded_cpu')
+backend_test.exclude('test_affine_grid_3d_align_corners_expanded_cpu')
+backend_test.exclude('test_affine_grid_3d_expanded_cpu')
+backend_test.exclude('test_range_int32_type_negative_delta_expanded_cpu')
 
 # unsupported (strange) ops
-backend_test.exclude('test_bitwise_*')
 backend_test.exclude('test_blackmanwindow_*')
 backend_test.exclude('test_bernoulli_*')
-backend_test.exclude('test_cumsum_*')
-
-backend_test.exclude('test_tril_zero_cpu') # TODO: zero array support
-backend_test.exclude('test_triu_zero_cpu') # TODO: zero array support
-
+backend_test.exclude('test_det_*')
 backend_test.exclude('test_col2im_*')
 backend_test.exclude('test_hammingwindow_*')
 backend_test.exclude('test_hannwindow_*')
 backend_test.exclude('test_hardmax_*')
 backend_test.exclude('test_gridsample_*')
-backend_test.exclude('test_compress_*')
-backend_test.exclude('test_det_*')
 backend_test.exclude('test_dft_*')
-backend_test.exclude('test_einsum_*')
-backend_test.exclude('test_erf_*')
-backend_test.exclude('test_strnorm_*')
+backend_test.exclude('test_einsum_batch_diagonal_cpu*') # TODO: equation = '...ii ->...i'
+backend_test.exclude('test_einsum_inner_prod_cpu*') # TODO: equation = 'i,i'
 backend_test.exclude('test_unique_*')
 backend_test.exclude('test_sequence_*')
 backend_test.exclude('test_nonmaxsuppression_*')
 backend_test.exclude('test_reversesequence_*')
 backend_test.exclude('test_roialign_*')
-backend_test.exclude('test_top_k_*')
 backend_test.exclude('test_tfidfvectorizer_*')
 backend_test.exclude('test_stft_*')
 backend_test.exclude('test_melweightmatrix_*')
 
 # more strange ops
-backend_test.exclude('test_center_crop_pad_crop_*')
 backend_test.exclude('test_basic_deform_conv_*')
 backend_test.exclude('test_deform_conv_*')
 backend_test.exclude('test_lppool_*')
-backend_test.exclude('test_depthtospace_*')
-backend_test.exclude('test_spacetodepth_*')
-backend_test.exclude('test_scan*')
-backend_test.exclude('test_ai_onnx_ml_array_feature_extractor_*')
+backend_test.exclude('test_scan_*')
 backend_test.exclude('test_split_to_sequence_*')
+backend_test.exclude('test_resize_downsample_scales_cubic_*') # unsure how to implement cubic
+backend_test.exclude('test_resize_downsample_sizes_cubic_*') # unsure how to implement cubic
+backend_test.exclude('test_resize_upsample_scales_cubic_*') # unsure how to implement cubic
+backend_test.exclude('test_resize_upsample_sizes_cubic_*') # unsure how to implement cubic
+backend_test.exclude('test_ai_onnx_ml_tree_ensemble_*') # https://github.com/onnx/onnx/blob/main/onnx/reference/ops/aionnxml/op_tree_ensemble.py#L121
+
+# rest of the failing tests
+backend_test.exclude('test_resize_tf_crop_and_resize_cpu') # tf_crop_and_resize not implemented
+backend_test.exclude('test_resize_tf_crop_and_resize_axes_2_3_cpu') # tf_crop_and_resize not implemented
+backend_test.exclude('test_resize_tf_crop_and_resize_axes_3_2_cpu') # tf_crop_and_resize not implemented
+backend_test.exclude('test_resize_tf_crop_and_resize_extrapolation_value_cpu') # tf_crop_and_resize value not implemented
+backend_test.exclude('test_resize_downsample_scales_linear_antialias_cpu') # antialias not implemented
+backend_test.exclude('test_resize_downsample_sizes_linear_antialias_cpu') # antialias not implemented
+backend_test.exclude('test_ai_onnx_ml_label_encoder_tensor_value_only_mapping_cpu') # bad data type string
+backend_test.exclude('test_ai_onnx_ml_label_encoder_tensor_mapping_cpu') # bad data type string
+
+backend_test.exclude('test_scatternd_min_cpu') # min not yet supported
+backend_test.exclude('test_scatternd_max_cpu') # max not yet supported
+
+if Device.DEFAULT in ['GPU', 'METAL']:
+  backend_test.exclude('test_resize_upsample_sizes_nearest_axes_2_3_cpu')
+  backend_test.exclude('test_resize_upsample_sizes_nearest_axes_3_2_cpu')
+  backend_test.exclude('test_resize_upsample_sizes_nearest_cpu')
+
+if Device.DEFAULT == "METAL" or (OSX and Device.DEFAULT == "GPU"):
+  # numerical inaccuracy
+  backend_test.exclude('test_mish_cpu')
+  backend_test.exclude('test_mish_expanded_cpu')
 
 # disable model tests for now since they are slow
 if not getenv("MODELTESTS"):

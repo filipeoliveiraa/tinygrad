@@ -1,11 +1,10 @@
 from pathlib import Path
 import numpy as np
-from tqdm import trange
 import torch
 from torchvision.utils import make_grid, save_image
-from tinygrad.state import get_parameters
+from tinygrad.nn.state import get_parameters
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import getenv
+from tinygrad.helpers import trange
 from tinygrad.nn import optim
 from extra.datasets import fetch_mnist
 
@@ -17,9 +16,9 @@ class LinearGen:
     self.l4 = Tensor.scaled_uniform(1024, 784)
 
   def forward(self, x):
-    x = x.dot(self.l1).leakyrelu(0.2)
-    x = x.dot(self.l2).leakyrelu(0.2)
-    x = x.dot(self.l3).leakyrelu(0.2)
+    x = x.dot(self.l1).leaky_relu(0.2)
+    x = x.dot(self.l2).leaky_relu(0.2)
+    x = x.dot(self.l3).leaky_relu(0.2)
     x = x.dot(self.l4).tanh()
     return x
 
@@ -32,9 +31,9 @@ class LinearDisc:
 
   def forward(self, x):
     # balance the discriminator inputs with const bias (.add(1))
-    x = x.dot(self.l1).add(1).leakyrelu(0.2).dropout(0.3)
-    x = x.dot(self.l2).leakyrelu(0.2).dropout(0.3)
-    x = x.dot(self.l3).leakyrelu(0.2).dropout(0.3)
+    x = x.dot(self.l1).add(1).leaky_relu(0.2).dropout(0.3)
+    x = x.dot(self.l2).leaky_relu(0.2).dropout(0.3)
+    x = x.dot(self.l3).leaky_relu(0.2).dropout(0.3)
     x = x.dot(self.l4).log_softmax()
     return x
 
@@ -59,7 +58,7 @@ def train_discriminator(optimizer, data_real, data_fake):
   loss_real.backward()
   loss_fake.backward()
   optimizer.step()
-  return (loss_real + loss_fake).cpu().numpy()
+  return (loss_real + loss_fake).numpy()
 
 def train_generator(optimizer, data_fake):
   real_labels = make_labels(batch_size, 1)
@@ -68,7 +67,7 @@ def train_generator(optimizer, data_fake):
   loss = (output * real_labels).mean()
   loss.backward()
   optimizer.step()
-  return loss.cpu().numpy()
+  return loss.numpy()
 
 if __name__ == "__main__":
   # data for training and validation
@@ -88,6 +87,7 @@ if __name__ == "__main__":
   optim_g = optim.Adam(get_parameters(generator),lr=0.0002, b1=0.5)  # 0.0002 for equilibrium!
   optim_d = optim.Adam(get_parameters(discriminator),lr=0.0002, b1=0.5)
   # training loop
+  Tensor.training = True
   for epoch in (t := trange(epochs)):
     loss_g, loss_d = 0.0, 0.0
     for _ in range(n_steps):
@@ -100,7 +100,7 @@ if __name__ == "__main__":
       data_fake = generator.forward(noise)
       loss_g += train_generator(optim_g, data_fake)
     if (epoch + 1) % sample_interval == 0:
-      fake_images = generator.forward(ds_noise).detach().cpu().numpy()
+      fake_images = generator.forward(ds_noise).detach().numpy()
       fake_images = (fake_images.reshape(-1, 1, 28, 28) + 1) / 2  # 0 - 1 range.
       save_image(make_grid(torch.tensor(fake_images)), output_dir / f"image_{epoch+1}.jpg")
     t.set_description(f"Generator loss: {loss_g/n_steps}, Discriminator loss: {loss_d/n_steps}")

@@ -3,7 +3,7 @@ import heapq
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat, GroupOp
-from tinygrad.helpers import dedup, partition, all_same, flatten
+from tinygrad.helpers import dedup, partition, all_same, flatten, getenv
 from tinygrad.uop.spec import type_verify
 
 # NOTE: any toposort should be valid here, unlike last time this isn't required, it's just for speed
@@ -72,7 +72,7 @@ class BlockContext:
   child_count: dict[UOp, int]
   block_ctxs: dict[UOp, tuple[UOp, ...]]
   child_ctxs: dict[UOp, tuple[UOp, ...]]
-  def last_ctx(self, u): return ret if (ret:=self.child_ctxs.get(u)) is not None else self.block_ctxs[u]
+  def last_ctx(self, u): return self.child_ctxs.get(u, self.block_ctxs[u])
   @staticmethod
   def from_sink(sink:UOp) -> BlockContext:
     # get children and all block contexts
@@ -158,7 +158,8 @@ def make_block_bottom_up(ctx:BlockContext, x:UOp):
     base_block = UOp(Ops.BLOCKSTART, src=tuple(v), arg=(new_ctx, new_child_ctx))
     srcs.append(add_blockends(base_block, new_ctx, current_ctx))
 
-  lst = block_reorder(lst[::-1])
+  lst = lst[::-1]
+  if getenv("BLOCK_REORDER", 1): lst = block_reorder(lst)
   bb = BasicBlock(tuple(lst), ctx=current_ctx, cnt=child_count, child_ctx=child_ctx)
   return UOp(Ops.BLOCK, src=tuple(srcs), arg=bb)
 
@@ -211,9 +212,8 @@ def remove_blockend(x:UOp):
   # if there's any remaining blocks that need to go in this BLOCKEND, we don't remove it
   if any(x.arg.end in y.arg.ctx for y in x.src if y.op in {Ops.BLOCK, Ops.BLOCKEND}): return None
 
-  parent_blocks = [y for y in x.src if y.op is Ops.BLOCK and y.arg.child_ctx is not None and x.arg.end in y.arg.child_ctx]
-  assert all_same(parent_blocks), f"should never have two parent blocks (has {len(parent_blocks)})"
-  if len(parent_blocks) > 0:
+  if (parent_blocks := [y for y in x.src if y.op is Ops.BLOCK and y.arg.child_ctx is not None and x.arg.end in y.arg.child_ctx]):
+    assert all_same(parent_blocks), f"should never have two parent blocks (has {len(parent_blocks)})"
     parent_block = parent_blocks[0]
     assert len(parent_blocks) == parent_block.arg.cnt
     # range needs DEFINE_ACC to be before the range (never in DEFINE_ACC for if)

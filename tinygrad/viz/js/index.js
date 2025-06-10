@@ -47,6 +47,10 @@ async function renderDag(graph, additions, recenter=false) {
       return `translate(-${x}, -${y})`;
     }).selectAll("text").data(d => [d.label.split("\n")]).join("text").selectAll("tspan").data(d => d).join("tspan").text(d => d).attr("x", "0")
       .attr("dy", 14).attr("xml:space", "preserve");
+    const tags = nodes.selectAll("g.tag").data(d => d.tag != null ? [d] : []).join("g").attr("class", "tag")
+      .attr("transform", d => `translate(${-d.width/2+8}, ${-d.height/2+8})`);
+    tags.selectAll("circle").data(d => [d]).join("circle");
+    tags.selectAll("text").data(d => [d.tag]).join("text").text(d => d).attr("dy", "0.35em");
     // draw edges
     const line = d3.line().x(d => d.x).y(d => d.y).curve(d3.curveBasis);
     d3.select("#edges").selectAll("path.edgePath").data(g.edges()).join("path").attr("class", "edgePath").attr("d", (e) => {
@@ -70,11 +74,9 @@ async function renderDag(graph, additions, recenter=false) {
       const x = p2.x - ux * offset;
       const y = p2.y - uy * offset;
       return `translate(${x}, ${y})`
-    });
-    edgeLabels.selectAll("circle").data(e => [g.edge(e).label]).join("circle").attr("r", 5).attr("fill", "#FFD700").attr("stroke", "#B8860B")
-      .attr("stroke-width", 0.8);
-    edgeLabels.selectAll("text").data(e => [g.edge(e).label]).join("text").text(d => d).attr("text-anchor", "middle").attr("dy", "0.35em")
-      .attr("font-size", "6px").attr("fill", "black");
+    }).attr("class", "tag");
+    edgeLabels.selectAll("circle").data(e => [g.edge(e).label]).join("circle");
+    edgeLabels.selectAll("text").data(e => [g.edge(e).label]).join("text").text(d => d).attr("dy", "0.35em");
     if (recenter) document.getElementById("zoom-to-fit-btn").click();
   };
 
@@ -318,21 +320,21 @@ async function main() {
   if (currentCtx == -1) return;
   const ctx = ctxs[currentCtx];
   const step = ctx.steps[currentStep];
-  const cacheKey = `ctx=${currentCtx}&idx=${currentStep}`;
+  const ckey = `ctx=${currentCtx}&idx=${currentStep}`;
   // close any pending event sources
   let activeSrc = null;
   for (const e of evtSources) {
-    if (e.url.split("?")[1] !== cacheKey) e.close();
+    if (e.url.split("?")[1] !== ckey) e.close();
     else if (e.readyState === EventSource.OPEN) activeSrc = e;
   }
-  if (cacheKey in cache) {
-    ret = cache[cacheKey];
+  if (ckey in cache) {
+    ret = cache[ckey];
   }
   // if we don't have a complete cache yet we start streaming rewrites in this step
-  if (!(cacheKey in cache) || (cache[cacheKey].length !== step.match_count+1 && activeSrc == null)) {
+  if (!(ckey in cache) || (cache[ckey].length !== step.match_count+1 && activeSrc == null)) {
     ret = [];
-    cache[cacheKey] = ret;
-    const eventSource = new EventSource(`/ctxs?ctx=${currentCtx}&idx=${currentStep}`);
+    cache[ckey] = ret;
+    const eventSource = new EventSource(`/ctxs?${ckey}`);
     evtSources.push(eventSource);
     eventSource.onmessage = (e) => {
       if (e.data === "END") return eventSource.close();

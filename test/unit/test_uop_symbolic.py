@@ -8,7 +8,7 @@ from tinygrad.codegen.late.devectorizer import sym
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import UOp, Ops, graph_rewrite, sym_infer
 from tinygrad import Variable
-from tinygrad.uop.spec import z3_renderer
+from tinygrad.uop.spec import uops_to_z3
 
 def render(self) -> tuple[str, ConstType, ConstType]:
   # NOTE: we need STORE so the ALU op has children
@@ -32,9 +32,8 @@ class TestSymbolic(unittest.TestCase):
   def helper_test_variable(self, v, n, m, s, test_z3:bool=True):
     if test_z3:
       solver = z3.Solver()
-      z3_sink = graph_rewrite(v.sink(v.simplify()), z3_renderer, ctx=(solver, {}))
-      expr, epxr_simplified = z3_sink.src[0].arg, z3_sink.src[1].arg
-      self.assertEqual(solver.check(expr != epxr_simplified), z3.unsat, "simplified expression not equal to original")
+      expr, expr_simplified = uops_to_z3(solver, v, v.simplify())
+      self.assertEqual(solver.check(expr != expr_simplified), z3.unsat, "simplified expression not equal to original")
     rendered, nmin, nmax = render(v)
     if isinstance(s, tuple): self.assertIn(rendered, s)
     else: self.assertEqual(rendered, s)
@@ -208,6 +207,16 @@ class TestSymbolic(unittest.TestCase):
     # test _min_max directly without the rewrite taking out the sign
     self.assertEqual((Variable("x", -10, 0)%Variable("y", -10, -1))._min_max, (-9, 0))
     self.assertEqual((Variable("x", -10, 0)%Variable("y", 1, 10))._min_max, (-9, 0))
+
+  def test_range_div_its_symbolic_bound(self):
+    a = Variable("a", 1, 10)
+    ridx0 = UOp.range(a+2, 0)
+    self.helper_test_variable(ridx0//(a+2), 0, 0, "0")
+
+  def test_range_mod_its_symbolic_bound(self):
+    a = Variable("a", 1, 10)
+    ridx = UOp.range(a+2, 0)
+    self.helper_test_variable(ridx%(a+2), 0, 11, "ridx0")
 
   def test_div_min_max(self):
     self.helper_test_variable(Variable("a", 2, 7) // 2, 1, 3, "(a//2)")
@@ -640,15 +649,16 @@ class TestSymbolic(unittest.TestCase):
     cond = Variable("x", 0, 3) < 2
     a = Variable("a", 0, 3)
     b = Variable("b", 0, 3)
+    c = Variable("c", 0, 3)
     aa = cond.where(a, a.ufix(0))
     bb = cond.where(b, b.ufix(1))
     self.helper_test_variable(aa, 0, 3, "(a if (x<2) else 0)")
     self.helper_test_variable(bb, 0, 3, "(b if (x<2) else 1)")
     self.helper_test_variable(aa+bb, 0, 6, "((a+b) if (x<2) else 1)")
     self.helper_test_variable(aa.maximum(bb), 0, 3, "(max(a, b) if (x<2) else 1)")
+    self.helper_test_variable((c+aa)+bb, 0, 9, "(c+((a+b) if (x<2) else 1))")
 
     # not combining because it increased total ALU
-    c = Variable("c", 0, 3)
     cc = cond.where(c, c+1)
     self.helper_test_variable(bb+cc, 0, 7, "((b if (x<2) else 1)+(c if (x<2) else (c+1)))")
 

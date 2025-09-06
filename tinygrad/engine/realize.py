@@ -1,14 +1,14 @@
 from typing import cast, Generator, Callable
-import time, pprint, decimal, random, itertools, math
+import time, pprint, random, itertools, math
 from dataclasses import dataclass, replace, field
 from tinygrad.helpers import all_same, colored, DEBUG, GlobalCounters, ansilen, BEAM, NOOPT, all_int, CAPTURING, Metadata, TRACEMETA, TracingKey
-from tinygrad.helpers import DEVECTORIZE, time_to_str, VALIDATE_WITH_CPU, getenv, cpu_profile, PROFILE, ProfilePointEvent, cpu_events, prod
-from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, Variable, sym_infer, graph_rewrite, print_uops, track_rewrites, KernelInfo
+from tinygrad.helpers import DEVECTORIZE, time_to_str, VALIDATE_WITH_CPU, getenv, cpu_profile, PROFILE, ProfilePointEvent, cpu_events, prod, Context
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, Variable, sym_infer, graph_rewrite, print_uops, track_rewrites, KernelInfo, pyrender
 from tinygrad.device import Device, Buffer
 from tinygrad.renderer import Renderer, ProgramSpec, Estimates
 from tinygrad.engine.schedule import ScheduleItem
 from tinygrad.codegen import full_rewrite
-from tinygrad.codegen.opt.kernel import Opt
+from tinygrad.codegen.opt import Opt
 
 # **************** Program Creation ****************
 
@@ -26,6 +26,7 @@ def get_program(ast:UOp, renderer:Renderer|None=None, opts:list[Opt]|None=None) 
   """
 
   if getenv("VIZ"): graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
+  if DEBUG >= 5: print('\n'.join(pyrender(ast)))
 
   # linearize
   if renderer is None: renderer = Device.default.renderer
@@ -34,9 +35,10 @@ def get_program(ast:UOp, renderer:Renderer|None=None, opts:list[Opt]|None=None) 
     ast = ast.replace(arg=KernelInfo(opts_to_apply=tuple(opts)))
   try:
     uops = full_rewrite(ast, renderer)
-  except RuntimeError:
+  except RuntimeError as e:
     print("***** LINEARIZE FAILURE *****")
-    print(f"ast = {ast}")
+    print(e)
+    print('\n'.join(pyrender(ast)))
     raise
   assert uops[-1].op is Ops.SINK, "last uop must be sink"
 
@@ -161,8 +163,7 @@ class ExecItem:
   def run(self, _var_vals:dict[Variable, int]|None=None, wait=False, jit=False, do_update_stats=True) -> float|None:
     var_vals = self.fixedvars if _var_vals is None else (_var_vals|self.fixedvars)
     bufs = [cast(Buffer, x) for x in self.bufs] if jit else [cast(Buffer, x).ensure_allocated() for x in self.bufs]
-    if PROFILE: cpu_events.append(ProfilePointEvent(self.prg.device, "exec", decimal.Decimal(time.perf_counter_ns())/1000, self.prg.display_name,
-                                                    {"metadata":self.metadata, "var_vals":var_vals}))
+    if PROFILE: cpu_events.append(ProfilePointEvent(self.prg.device, "exec", self.prg.display_name, {"metadata":self.metadata, "var_vals":var_vals}))
     et = self.prg(bufs, var_vals, wait=wait or DEBUG >= 2)
     if do_update_stats:
       GlobalCounters.kernel_count += 1
@@ -223,7 +224,7 @@ def run_schedule(schedule:list[ScheduleItem], var_vals:dict[Variable, int]|None=
       ei.run(var_vals, do_update_stats=do_update_stats)
 
       # validate the output buffers match (NOTE: this is assuming the output is buffer 0)
-      lower_schedule_item(ScheduleItem(si.ast, nb, si.metadata, si.fixedvars)).run(var_vals, do_update_stats=do_update_stats)
+      with Context(BEAM=0): lower_schedule_item(ScheduleItem(si.ast, nb, si.metadata, si.fixedvars)).run(var_vals, do_update_stats=do_update_stats)
       import numpy as np
       np.testing.assert_allclose(si.bufs[0].numpy(), nb[0].numpy(), rtol=1e-3, atol=1e-3)
     else:

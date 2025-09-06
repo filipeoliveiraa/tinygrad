@@ -297,7 +297,6 @@ class TestUint8DType(TestDType):
   def test_uint8_to_int8_overflow(self):
     _test_op(lambda: Tensor([255, 254, 253, 252], dtype=dtypes.uint8).cast(dtypes.int8), dtypes.int8, [-1, -2, -3, -4])
 
-@unittest.skipIf(Device.DEFAULT == "WEBGL", "No bitcast on WebGL")
 class TestBitCast(unittest.TestCase):
   @given(strat.sampled_from(dtype_ints + dtype_floats), strat.sampled_from(dtype_ints + dtype_floats))
   def test_shape_change_bitcast(self, dt1, dt2):
@@ -427,6 +426,11 @@ class TestOpsBFloat16(unittest.TestCase):
     # TODO: wrong output with GPU=1 on mac
     data = [60000.0, 70000.0, 80000.0]
     np.testing.assert_allclose(Tensor(data).cast("bfloat16").numpy(), torch.tensor(data).type(torch.bfloat16).float().numpy())
+
+  def test_no_approximation(self):
+    data = [326.0, 339.0, 10603200512.0]
+    expected = torch.tensor(data, dtype=torch.bfloat16).sqrt().float().numpy()
+    np.testing.assert_allclose(Tensor(data, dtype=dtypes.bfloat16).sqrt().numpy(), expected)
 
 if __name__ == '__main__':
   unittest.main()

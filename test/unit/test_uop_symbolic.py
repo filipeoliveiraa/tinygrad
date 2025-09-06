@@ -560,8 +560,13 @@ class TestSymbolic(unittest.TestCase):
 
   def test_div_mod_recombine(self):
     gidx = Variable("gidx", 0, 124)
+    lidx = Variable("lidx", 0, 124)
     self.helper_test_variable(gidx%4+(gidx//4)*4, 0, 124, "gidx")
     self.helper_test_variable((gidx//4)*4+gidx%4, 0, 124, "gidx")
+    self.helper_test_variable(lidx+gidx%4+(gidx//4)*4, 0, 248, "(gidx+lidx)")
+    self.helper_test_variable(lidx+(gidx//4)*4+gidx%4, 0, 248, "(gidx+lidx)")
+    self.helper_test_variable(lidx+(gidx//4)*8+2*(gidx%4), 0, 372, "(lidx+(gidx*2))")
+    self.helper_test_variable(lidx+2*(gidx%4)+(gidx//4)*8, 0, 372, "(lidx+(gidx*2))")
 
   def test_div_mod_recombine_folded_mod(self):
     a = Variable("a", 0, 2)
@@ -731,6 +736,12 @@ class TestSymbolic(unittest.TestCase):
   def test_trunc_noop(self):
     a = Variable("a", 1, 10, dtypes.int)
     self.helper_test_variable(a.trunc(), 1, 10, "a", test_z3=False)
+
+  def test_do_math_in_int32(self):
+    a = Variable("a", 1, 10)
+    b = Variable("b", 1, 10)
+    self.helper_test_variable(a.cast(dtypes.long)+b.cast(dtypes.long), 2, 20, "(long)((a+b))")
+    self.helper_test_variable(a.cast(dtypes.long)*b.cast(dtypes.long), 1, 100, "(long)((a*b))")
 
 class TestSymbolicNumeric(unittest.TestCase):
   def helper_test_numeric(self, f):

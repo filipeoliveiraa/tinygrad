@@ -29,7 +29,7 @@ earliest_rewrites = double_reshape+PatternMatcher([
 
   # preserve tags?
   # UOp with size 0 is zero
-  (UPat(GroupOp.All-{Ops.SINK}, name="root"), lambda root: root.const_like(0) if root.base.st is not None and root.size == 0 else None),
+  #(UPat(GroupOp.All-{Ops.SINK}, name="root"), lambda root: root.const_like(0) if root.base.st is not None and root.size == 0 else None),
   # reduce of size 0 is the identity element
   (UPat(Ops.REDUCE_AXIS, name="reduce", src=(UPat.var("x"),)),
    lambda reduce,x: reduce.const_like(identity_element(reduce.arg[0], reduce.dtype)) if x.size == 0 and reduce.size != 0 else None),
@@ -169,12 +169,12 @@ def map_expand(r:UOp, idx:UOp):
   non_ending_ranges = []
   for a,x,y in zip(idx.src[1:], r.src[0].shape, r.shape):
     axis_to_range = [u for u in a.toposort() if u.op is Ops.RANGE]
-    if resolve(x!=y, False):
-      ending_ranges.extend(axis_to_range)
-      new_rngs.append(a.const_like(0))
-    else:
+    if resolve(x==y, False):
       non_ending_ranges.extend(axis_to_range)
       new_rngs.append(a)
+    else:
+      ending_ranges.extend(axis_to_range)
+      new_rngs.append(a.const_like(0))
   ending_ranges = [x.arg for x in ending_ranges if x not in non_ending_ranges]
   if idx.arg is not None: ending_ranges.append(idx.arg)
   return r.src[0].index(*new_rngs, arg=min(ending_ranges) if ending_ranges else None)
@@ -320,13 +320,16 @@ pm_rangeify = pm_mops+PatternMatcher([
   (UPat(Ops.CHILD, src=(UPat(Ops.CHILDREN, src=(UPat.var("x"),)),)), lambda x: x),
 
   # CONST (or DEFINE_VAR) can't have axes. remove srcs when we INDEX it
-  (UPat(Ops.INDEX, src=(UPat((Ops.CONST, Ops.DEFINE_VAR), name="c"),)), lambda c: c.replace(src=())),
+  (UPat(Ops.INDEX, src=(UPat((Ops.CONST, Ops.DEFINE_VAR), name="c"),)), lambda c: c.replace(tag=None)),
 
   # copy on CONST is CONST
   (UPat(Ops.COPY, src=(UPat.cvar("c"), UPat())), lambda c: c),
 
   # handle arg on any op with weight. old endrange stuff
   (UPat(Ops.INDEX, src=(UPat(GroupOp.Elementwise.union({Ops.REDUCE_AXIS})),), allow_any_len=True, name="idx"), might_end_axis),
+
+  # handle size 0
+  (UPat(Ops.INDEX, name="x"), lambda x: x.replace(src=(x.const_like(0),)+x.src[1:]) if x.st is not None and x.size == 0 else None),
 
   # handle assign
   (UPat(Ops.INDEX, src=(UPat(Ops.ASSIGN, name="assign"),), allow_any_len=True, name="x"),
@@ -373,7 +376,8 @@ def remove_bufferize(src:UOp, buf:UOp, idx:UOp):
   # here is where we compute the cost
   # for now just no REDUCE, COPY, or ASSIGN
   ran = src.toposort(gate=lambda x: x.op not in {Ops.INDEX})
-  if any(x.op in {Ops.REDUCE, Ops.COPY, Ops.ASSIGN} for x in ran): return None
+  # we don't want to bufferize threefry, also causes problems because not all platforms support long
+  if any(x.op in {Ops.REDUCE, Ops.COPY, Ops.ASSIGN} for x in ran) and src.op is not Ops.THREEFRY: return None
 
   # simple, matching old behavior
   #if src.op is not Ops.INDEX: return None
@@ -390,9 +394,10 @@ pm_cleanups = double_reshape+pm_mops+PatternMatcher([
   # remove reindexing with cost function
   (UPat.var("src").f(Ops.BUFFERIZE, allow_any_len=True, name="buf").f(Ops.INDEX, allow_any_len=True, name="idx"), remove_bufferize),
   # no buffers for const
-  (UPat(Ops.CONST, name='c').f(Ops.BUFFERIZE, allow_any_len=True, name="b"), lambda c,b: c.reshape((1,)*len(b.shape)).expand(b.shape)),
+  (UPat(Ops.CONST, name='c').f(Ops.BUFFERIZE, allow_any_len=True, name="b"),
+   lambda c,b: c.reshape((1,)*len(b.shape)).expand(b.shape).replace(tag=b.tag)),
   # if any CONST with DEVICE make it here (symbolic/copy issue), remove it
-  (UPat(Ops.DEVICE).f(Ops.CONST, name="c"), lambda c: c.replace(src=())),
+  #(UPat(Ops.DEVICE).f(Ops.CONST, name="c"), lambda c: c.replace(src=())),
 ])
 
 # *****************
@@ -491,7 +496,7 @@ to_define_global = PatternMatcher([
 
   # HACK in case any CONSTs were replaced
   # this is only needed if you are using symbolic
-  #(UPat(Ops.CONST, name="c"), lambda c: c.replace(src=()) if len(c.src) else None),
+  (UPat((Ops.CONST, Ops.DEFINE_VAR), name="c"), lambda c: c.replace(src=(), tag=None) if len(c.src) else None),
 
   # renumber the ranges starting with 0 so that kernel deduping works
   (UPat(Ops.RANGE, name="r"), renumber_range),
@@ -574,7 +579,7 @@ def get_rangeify_map(sink:UOp) -> dict[UOp, UOp]:
 
   # rebuild the sink with all the BUFFERIZEs with tags, this is what's ending up in the tensor graph
   # if it's not tagged by here, it's out
-  tsink = UOp.sink(*[x for x in tsink.parents if x.op is Ops.BUFFERIZE and x.tag is not None])
+  tsink = UOp.sink(*[x for x in tsink.parents if (x.op is Ops.BUFFERIZE or x.base.op in {Ops.CONST}) and x.tag is not None])
 
   if getenv("VIZ"): graph_rewrite(tsink, PatternMatcher([]), name="View Tagged Rangeify")
 

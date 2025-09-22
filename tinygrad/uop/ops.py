@@ -13,9 +13,11 @@ if TYPE_CHECKING:
   from tinygrad.device import Buffer, MultiBuffer
 
 class AxisType(Enum):
-  def __repr__(self): return f"AxisType.{self.name}"
+  def __repr__(self): return str(self)
   GLOBAL = auto(); WARP = auto(); LOCAL = auto(); LOOP = auto(); GROUP_REDUCE = auto(); REDUCE = auto(); UPCAST = auto(); UNROLL = auto() # noqa: E702
   THREAD = auto()
+
+range_start = {Ops.BUFFERIZE: 1, Ops.REDUCE: 1, Ops.STORE: 2, Ops.WMMA: 3}
 
 # https://en.wikipedia.org/wiki/Identity_element
 def identity_element(op:Ops, dt:DType) -> ConstType: return dtypes.as_const({Ops.ADD:0, Ops.MUL:1, Ops.MAX:dtypes.min(dt)}[op], dt)
@@ -212,7 +214,6 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   @functools.cached_property
   def ranges(self) -> dict[UOp, None]:
     if self.op is Ops.RANGE: return {self:None}
-    range_start = {Ops.BUFFERIZE: 1, Ops.REDUCE: 1, Ops.STORE: 2, Ops.WMMA: 3}
     ret: dict[UOp, None] = {}
     if self.op in range_start.keys():
       for s in self.src[:range_start[self.op]]: ret.update(s.ranges)

@@ -2108,7 +2108,6 @@ class TestView(unittest.TestCase):
   # a*VIEW(x), where VIEW(x) = 0
   # x+2
   # as long as one child realizes, x does not collapse
-  @expect_rangeify_fails
   def test_parent_multiple_children_no_collapse(self):
     a = Tensor([1, 2])
     b = Tensor.arange(3).contiguous()
@@ -2216,6 +2215,15 @@ class TestCopyFolding(unittest.TestCase):
     check_schedule(b, 0, filter_sink=False)
     b = schedule_graph_rewrite(b)
     self.assertIs(b.base, a.base)
+
+  def test_copy_to_same_device_sched(self):
+    a = Tensor.ones(4).contiguous().realize().uop.as_buf()
+    t = Tensor(a.copy_to_device(a.device))
+    sched = t.schedule()
+    assert len([s for s in sched if s.ast.op is Ops.COPY]) == 0
+    run_schedule(sched)
+    assert t.uop.is_realized, f"didn't realize Tensor {t}"
+    self.assertListEqual(t.tolist(), [1.,1.,1.,1.])
 
   def test_clone(self):
     a = Tensor.empty(4)

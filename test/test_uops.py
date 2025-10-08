@@ -1,8 +1,6 @@
 from typing import Optional, Any
 import unittest, math
 import numpy as np
-from tinygrad.shape.shapetracker import ShapeTracker
-from tinygrad.shape.view import View # noqa F401
 from tinygrad.tensor import Tensor, _to_np_dtype
 from tinygrad.helpers import CI, DEBUG, getenv, Timing
 from tinygrad.dtype import dtypes, DType, AddrSpace
@@ -492,15 +490,6 @@ class TestUOpMethod(unittest.TestCase):
     self.assertIs(x.replace(arg=None).arg, None)
     with self.assertRaises(AssertionError): x.replace(field="a")
 
-  def test_device(self):
-    x = UOp(Ops.VIEW, dtypes.int, (UOp.new_buffer(Device.DEFAULT, 1, dtypes.int), UOp.const(dtypes.int, 1)), ShapeTracker.from_shape(()))
-    self.assertEqual(x.device, Device.DEFAULT)
-    # NOTE: CONST doesn't have device
-    buffer, const = x.src
-    self.assertEqual(buffer.device, Device.DEFAULT)
-    self.assertEqual(const._device, None)
-    with self.assertRaises(AssertionError): const.device
-
 class TestUOpStr(unittest.TestCase):
   def test_uop_str(self):
     a = UOp(Ops.CONST, dtypes.float, (), 2.0) + UOp(Ops.CONST, dtypes.float, (), 3.0)
@@ -543,6 +532,11 @@ class TestUopsObject(unittest.TestCase):
   def test_timing(self):
     with Timing("create 10k uops:"): ret = [UOp(Ops.CONST, dtypes.int, arg=10000000+i) for i in range(10000)]
     assert len(ret) == 10000
+
+  def test_nested(self):
+    a = UOp.new_buffer(Device.DEFAULT, 1, dtypes.char)
+    for _ in range(10_000): a = a+a
+    self.assertEqual(a.device, Device.DEFAULT)
 
 class TestUOpRender(unittest.TestCase):
   def test_render_vectorize_same(self):

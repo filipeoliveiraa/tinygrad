@@ -9,6 +9,7 @@ from hypothesis import given, settings, strategies as strat
 from tinygrad.device import is_dtype_supported
 from tinygrad.uop.ops import Ops, UOp
 from tinygrad.renderer.ptx import PTXRenderer
+from tinygrad.renderer.nir import NIRRenderer
 from tinygrad.codegen import full_rewrite
 from tinygrad.dtype import DType
 
@@ -526,6 +527,7 @@ class TestTinygrad(unittest.TestCase):
     self.assertListEqual(t.shrink_to(16).tolist(), list(range(16)))
     t = t.reshape(4, 8).contiguous().realize()
     self.assertListEqual(t.shrink_to(2, 2).tolist(), [[0, 1], [8, 9]])
+    self.assertListEqual(t.shrink_to(None, 2).tolist(), t.shrink_to(4, 2).tolist())
     with self.assertRaises(ValueError): t.shrink_to(2)
     with self.assertRaises(ValueError): t.shrink_to(2, 2, 2)
 
@@ -635,8 +637,10 @@ class TestZeroShapeTensor(unittest.TestCase):
 
     np.testing.assert_equal(Tensor([1, 2]).pad_to(4).numpy(), [1, 2, 0, 0])
     np.testing.assert_equal(Tensor([[1, 2]]).pad_to(2, 3).numpy(), [[1, 2, 0], [0, 0, 0]])
-    with self.assertRaises(TypeError): Tensor([1, 2]).pad_to(2, 3)
-    with self.assertRaises(TypeError): Tensor([[1, 2]]).pad_to(3)
+    np.testing.assert_equal(Tensor([[1, 2]]).pad_to(1, 3).numpy(), [[1, 2, 0]])
+    np.testing.assert_equal(Tensor([[1, 2]]).pad_to(None, 3).numpy(), [[1, 2, 0]])
+    with self.assertRaises(ValueError): Tensor([1, 2]).pad_to(2, 3)
+    with self.assertRaises(ValueError): Tensor([[1, 2]]).pad_to(3)
 
   def test_shrink_into_zero(self):
     t = Tensor.rand(3, 4).realize()
@@ -871,7 +875,8 @@ class TestIdxUpcast(unittest.TestCase):
     store = next(uop for uop in uops if uop.op is Ops.STORE)
     assert store.op is Ops.STORE
     idx = self._find_op(store, Ops.INDEX)
-    if idx is not None: # PTX turns Ops.INDEX into pointer arithmetic earlier than cstyle, plus it's already cast to int64
+    # PTX and NIR turn Ops.INDEX into pointer arithmetic earlier than cstyle, plus it's already cast to int64
+    if not isinstance(Device[Device.DEFAULT].renderer, (PTXRenderer, NIRRenderer)):
       assert idx.op is Ops.INDEX
       idx_val = idx.src[1]
       assert idx_val.dtype is dtype
@@ -895,7 +900,7 @@ class TestIdxUpcast(unittest.TestCase):
   def test_regular_sym(self):
     self.do_op_then_assert(dtypes.int, 2048, 2048, UOp.variable("dim3", 1, 64).bind(32))
 
-  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX always convert Ops.INDEX to int64")
+  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, (PTXRenderer, NIRRenderer)), "PTX and NIR always converts Ops.INDEX to int64")
   def test_symfold(self):
     # This would cause an overflow, but after sym fold it's within int32
     a = Tensor.arange(65535)

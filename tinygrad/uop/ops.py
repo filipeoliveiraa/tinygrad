@@ -10,7 +10,6 @@ from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Contex
 from tinygrad.helpers import PICKLE_BUFFERS, PROFILE, dedup, cdiv, cmod, diskcache_put, to_function_name, cpu_profile, TracingKey, VIZ, SPEC
 from tinygrad.helpers import strip_parens
 if TYPE_CHECKING:
-  from tinygrad.shape.shapetracker import ShapeTracker
   from tinygrad.device import Buffer, MultiBuffer
 
 class AxisType(Enum):
@@ -175,60 +174,11 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   # *** uop shape stuff ***
 
-  # TODO: remove this. it's used by the jit and split_reduceop
-  @recursive_property
-  def st(self) -> ShapeTracker|None:
-    if self.op is Ops.INDEX and self.src[0].op in {Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_REG, Ops.MSTACK,
-                                                   Ops.MSELECT, Ops.BUFFER, Ops.BUFFERIZE, Ops.VECTORIZE, Ops.STORE}:
-      return None
-    if self.op is Ops.INDEX and self.src[0].op is Ops.ASSIGN and self.src[0].src[1].op is Ops.KERNEL: return None
-    if self.op is Ops.BARRIER: return None
-    if self.op in GroupOp.Block: return None
-    from tinygrad.shape.shapetracker import ShapeTracker
-    # MovementOps define a new ShapeTracker from the arg
-    if self.op is Ops.BUFFERIZE: return ShapeTracker.from_shape(tuple([int(r.vmax+1) for r in self.src[1:]]))
-    # allow reshape from nothing
-    if self.op is Ops.RESHAPE and self.src[0].st is None: return ShapeTracker.from_shape(self.marg)
-    if self.op in GroupOp.Movement: return unwrap(self.src[0].st).mop(self.op, self.marg)
-    # CONST with a DEVICE has a shape of ()
-    if self.op is Ops.CONST and len(self.src) and self.src[0].op is Ops.DEVICE: return ShapeTracker.from_shape(())
-    if self.op is Ops.STORE and isinstance(self.dtype, PtrDType): return ShapeTracker.from_shape((self.dtype.size,))
-    if self.op is Ops.STORE and self.dtype is not dtypes.void: return self.src[0].src[0].st
-    # BufferOps and ASSIGN flow ShapeTracker from a direct edge
-    if self.op in {Ops.STORE, Ops.ASSIGN, Ops.LOAD}: return self.src[0].st
-
-    # BUFFER/BUFFER_VIEW and KERNEL only have a size
-    if self.op in {Ops.BUFFER, Ops.BUFFER_VIEW}: return ShapeTracker.from_shape((self.size,))
-    if self.op is Ops.KERNEL:
-      ast = self.arg.ast
-      return ShapeTracker.from_shape((ast.size,)) if ast.st is not None else None
-    if self.op in {Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_REG}:
-      sz = self.ptrdtype.size
-      return ShapeTracker.from_shape((sz,)) if sz > 0 else None
-
-    # hack for PTX, CASTing the ptr loses the shape
-    if self.op is Ops.CAST and self.src[0].op is Ops.DEFINE_GLOBAL: return None
-
-    # otherwise we get the shape from sources
-    if not (src_sts := [x.st for x in self.src if x.st is not None]): return None
-    assert all_same([x.shape for x in src_sts]), f"UOp sources must have the same shape {self} {[x.shape for x in src_sts]}"
-    shape = src_sts[0].shape
-    # shape changing ops
-    match self.op:
-      case Ops.MULTI: shape = tuple(s*len(self.device) if a == self.axis else s for a,s in enumerate(shape))
-      case Ops.BITCAST:
-        if (output_sz:=self.dtype.itemsize) != (input_sz:=self.src[0].dtype.itemsize): shape = shape[:-1]+((shape[-1]*input_sz) // output_sz,)
-      case Ops.REDUCE_AXIS | Ops.WMMA:
-        axis_arg = self.arg[1] if self.op is Ops.REDUCE_AXIS else self.arg[7]
-        assert isinstance(axis_arg, tuple) and all(isinstance(x, int) for x in axis_arg), f"invalid type for axis: {axis_arg}"
-        shape = tuple(1 if i in axis_arg else s for i,s in enumerate(shape))
-    return ShapeTracker.from_shape(shape)
-
   @recursive_property
   def _shape(self) -> tuple[sint, ...]|None:
     match self.op:
       # late ops don't have shape
-      case Ops.UNIQUE | Ops.DEVICE | Ops.RANGE | Ops.INDEX | Ops.LOAD | Ops.IF | Ops.BARRIER | \
+      case Ops.UNIQUE | Ops.DEVICE | Ops.RANGE | Ops.INDEX | Ops.LOAD | Ops.IF | Ops.BARRIER | Ops.CUSTOM | Ops.CUSTOMI | \
            Ops.VECTORIZE | Ops.VCONST | Ops.SUBSTITUTE | Ops.GEP | Ops.SPECIAL | Ops.UNROLL | Ops.PRECAST:
         return None
 
@@ -351,11 +301,11 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def __bool__(self): return self._eval((dtypes.bool,), bool)
   def __int__(self): return self._eval(dtypes.ints, int)
   def __float__(self): return self._eval(dtypes.floats, float)
-  def substitute(self, dvars:dict[UOp, UOp], name:str|None=None):
+  def substitute(self, dvars:dict[UOp, UOp], name:str|None=None, extra_pm:PatternMatcher|None=None):
     dvars = {k:v for k,v in dvars.items() if k is not v}
     if len(dvars) == 0: return self
     with Context(TRACK_MATCH_STATS=(0 if name is None else TRACK_MATCH_STATS.value)):
-      return graph_rewrite(self, _substitute, dvars, bottom_up=True, name=name)
+      return graph_rewrite(self, (extra_pm+_substitute) if extra_pm is not None else _substitute, dvars, bottom_up=True, name=name)
 
   # *** uop tracing stuff ***
 
@@ -420,15 +370,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     return UOp(Ops.RANGE, dtype=dtypes.index, src=(sint_to_uop(end),), arg=arg)
   def r(self, op:Ops, axis:tuple[int, ...]):
     axis = tuple(sorted([x for x in axis if resolve(self.shape[x] != 1)]))
-    if len(axis) == 0: return self
-    # move any non reduce axis before the first reduce axis
-    move_early, rest = partition(range(axis[0], len(self.shape)), lambda i: i not in axis and resolve(self.shape[i] != 1))
-    permaxis = tuple(range(axis[0])) + tuple(move_early) + tuple(rest)
-    ret = self.permute(permaxis)
-    new_axis = tuple([x for x in range(axis[0]+len(move_early), len(self.shape)) if resolve(ret.shape[x] != 1)])
-    assert len(axis) == len(new_axis)
-    ret = UOp(Ops.REDUCE_AXIS, self.dtype, (ret,), (op, new_axis))
-    return ret.reshape(tuple([x if i not in axis else 1 for i,x in enumerate(self.shape)]))
+    return UOp(Ops.REDUCE_AXIS, self.dtype, (self,), (op, axis)) if len(axis) else self
   @staticmethod
   def invalid(count=1): return UOp(Ops.CONST, dtypes.index.vec(count), src=(), arg=Invalid)
   def valid(self, cond): return self if cond.op is Ops.WHERE and cond.arg else cond.where(self, UOp.invalid(self.dtype.count))
@@ -439,7 +381,15 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     assert self.dtype.scalar() is dtypes.index, "Can only call get_valid on index dtype"
     return self.src[0] if self.op is Ops.WHERE and self.src[2].arg is Invalid else UOp.const(dtypes.bool, self.arg is not Invalid)
   def reduce(self, *src:UOp, **kwargs): return UOp(Ops.REDUCE, kwargs.pop('dtype', self.dtype), src=(self,)+src, **kwargs)
-  def contiguous(self, *args, **kwargs): return UOp(Ops.CONTIGUOUS, dtype=self.dtype, src=(self,)+args, **kwargs)
+
+  def is_contiguous(self):
+    # TODO: this is is_realized
+    if self.op is Ops.RESHAPE: return self.src[0].is_contiguous()
+    return self.op is Ops.BUFFER
+
+  def contiguous(self, *args, **kwargs):
+    if self.is_contiguous(): return self
+    return UOp(Ops.CONTIGUOUS, dtype=self.dtype, src=(self,)+args, **kwargs)
   def contiguous_backward(self): return self.alu(Ops.CONTIGUOUS_BACKWARD)
   def bufferize(self, *args, **kwargs): return UOp(Ops.BUFFERIZE, dtype=self.dtype, src=(self,)+args, **kwargs)
   def fuse(self): return self.alu(Ops.FUSE)
@@ -647,6 +597,9 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
   def unbind(self) -> tuple[Variable, int]:
     assert self.op is Ops.BIND and self.src[0].op is Ops.DEFINE_VAR and self.src[1].op is Ops.CONST, f"can't unbind {self}"
     return self.src[0], self.src[1].arg
+  def unbind_all(self) -> tuple[UOp, dict[Variable, int]]:
+    ret:dict[Variable, int] = {}
+    return graph_rewrite(self, pm_unbind, ctx=ret), ret
   @property
   def val(self) -> int: return self.unbind()[1]
   def vars(self) -> set[UOp]:
@@ -1219,6 +1172,12 @@ pm_lower_index_dtype = PatternMatcher([
 def _index_to_concrete_int(u:UOp): return graph_rewrite(u.sink(), pm_lower_index_dtype).src[0]
 
 _substitute = PatternMatcher([(UPat(tuple(Ops), name="x"), lambda ctx,x: ctx.get(x,None))])
+
+def do_unbind(ctx:dict[Variable, int], x:UOp):
+  v,i = x.unbind()
+  ctx[v] = i
+  return v
+pm_unbind = PatternMatcher([(UPat(Ops.BIND, name="x"), do_unbind)])
 
 # for debug
 syms = { Ops.ADD: "+", Ops.SUB: "-", Ops.IDIV: "//", Ops.MOD: "%", Ops.SHL: "<<", Ops.SHR: ">>",

@@ -333,7 +333,7 @@ def load_profile(lst:list[ProfileEvent]) -> dict:
       for _ in range(event_count):
         alloc, ts, key = u("<BII")
         if alloc: v["events"].append({"event":"alloc", "ts":ts, "key":key, "arg": {"dtype":strings[u("<I")[0]], "sz":u("<Q")[0]}})
-        else: v["events"].append({"event":"free", "ts":ts, "key":key})
+        else: v["events"].append({"event":"free", "ts":ts, "key":key, "arg":{"users":[u("<I")[0] for _ in range(u("<I")[0])]}})
   return {"dur":total_dur, "peak":global_peak, "layout":layout, "markers":markers}
 
 class TestVizProfiler(unittest.TestCase):
@@ -442,7 +442,7 @@ class TestVizMemoryLayout(BaseTestViz):
     profile_ret = load_profile(Buffer.profile_events)
     ret = profile_ret["layout"][f"{a.device} Memory"]
     self.assertEqual(ret["peak"], 2)
-    self.assertEqual(len(ret["events"]), 2)
+    self.assertEqual(len(ret["events"]), 4)
 
   def test_del_once(self):
     a = _alloc(1)
@@ -451,7 +451,7 @@ class TestVizMemoryLayout(BaseTestViz):
     profile_ret = load_profile(Buffer.profile_events)
     ret = profile_ret["layout"][f"{b.device} Memory"]
     self.assertEqual(ret["peak"], 1)
-    self.assertEqual(len(ret["events"]), 3)
+    self.assertEqual(len(ret["events"]), 4)
 
   def test_alloc_free(self):
     a = _alloc(1)
@@ -461,7 +461,7 @@ class TestVizMemoryLayout(BaseTestViz):
     profile_ret = load_profile(Buffer.profile_events)
     ret = profile_ret["layout"][f"{c.device} Memory"]
     self.assertEqual(ret["peak"], 2)
-    self.assertEqual(len(ret["events"]), 4)
+    self.assertEqual(len(ret["events"]), 6)
 
   def test_free_last(self):
     bufs = []
@@ -478,6 +478,26 @@ class TestVizMemoryLayout(BaseTestViz):
     self.assertEqual(ret["peak"], 3)
     self.assertEqual(len(ret["events"]), 6)
     self.assertEqual(len(profile["markers"]), 6)
+
+  def test_producer_simple(self):
+    a = Tensor.ones(10, device="NULL")
+    Tensor.realize(a.add(1).contiguous())
+    b = Tensor.ones(10, device="NULL")
+    Tensor.realize(b.add(1).contiguous())
+    profile = load_profile(cpu_events+Buffer.profile_events)
+    buffers = profile["layout"]["NULL Memory"]["events"]
+    programs = profile["layout"]["NULL"]["events"]
+    user_cnt = [len(b["arg"]["users"]) for b in buffers if b["arg"].get("users")]
+    self.assertEqual(len(user_cnt), len(programs))
+
+  def test_inflight_buf(self):
+    a = Tensor.empty(1, device="NULL")
+    n = 4
+    for i in range(n): (a+i).realize()
+    profile = load_profile(cpu_events+Buffer.profile_events)
+    buffers = profile["layout"]["NULL Memory"]["events"]
+    user_cnt = [len(b["arg"]["users"]) for b in buffers if b["arg"].get("users")]
+    self.assertEqual(max(user_cnt), n)
 
 if __name__ == "__main__":
   unittest.main()

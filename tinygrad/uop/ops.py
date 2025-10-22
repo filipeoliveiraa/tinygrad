@@ -291,8 +291,10 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
 
   @functools.cached_property
   def ended_ranges(self):
+    # copy of range_start
     match self.op:
       case Ops.REDUCE: return self.src[1:]
+      case Ops.STORE: return self.src[2:]
       case Ops.END: return self.src[:self.arg]
       case _: raise RuntimeError(f"{self.op} doesn't end ranges")
 
@@ -847,7 +849,8 @@ class UPat(MathTrait):
 
   # copied from UOp
   def sink(self, *srcs:UPat|None, **kwargs): return UPat(Ops.SINK, dtypes.void, (self,)+tuple([x for x in srcs if x is not None]), **kwargs)
-  def index(self, idx:UPat, valid:UPat|None=None): return UPat(Ops.INDEX, self.dtype, (self,idx,valid) if valid is not None else (self,idx))
+  def index(self, idx:UPat, valid:UPat|None=None, **kwargs):
+    return UPat(Ops.INDEX, self.dtype, (self,idx,valid) if valid is not None else (self,idx), **kwargs)
   def cast(self, dtype=None, **kwargs): return UPat(Ops.CAST, dtype, (self,), **kwargs)
   def bitcast(self, dtype=None): return UPat(Ops.BITCAST, dtype, (self,))
   def gep(self, i:int|None=None, **kwargs): return UPat(Ops.GEP, None, (self,), (i,) if i is not None else None, **kwargs)

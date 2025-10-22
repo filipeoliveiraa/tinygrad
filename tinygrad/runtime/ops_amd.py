@@ -15,7 +15,7 @@ from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.compiler_amd import HIPCompiler, AMDLLVMCompiler
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.am.amdev import AMDev, AMMemoryManager
-from tinygrad.runtime.support.amd import AMDReg, AMDIP, import_module, import_soc, setup_pci_bars
+from tinygrad.runtime.support.amd import AMDReg, AMDIP, import_module, import_soc, import_ip_offsets, setup_pci_bars
 from tinygrad.runtime.support.system import System, PCIIfaceBase, PCIAllocationMeta, MAP_FIXED, MAP_NORESERVE
 from tinygrad.runtime.support.usb import ASM24Controller, USBMMIOInterface
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
@@ -67,11 +67,14 @@ class AMDComputeQueue(HWQueue):
     if self.dev.xccs > 1:
       self._q[prev_len-1] |= (len(self._q) - prev_len)
 
-  def wait_reg_mem(self, value, mask=0xffffffff, mem=None, reg_req=None, reg_done=None):
-    wrm_info_dw = self.pm4.WAIT_REG_MEM_MEM_SPACE(int(mem is not None)) | self.pm4.WAIT_REG_MEM_OPERATION(int(mem is None)) \
-                | self.pm4.WAIT_REG_MEM_FUNCTION(WAIT_REG_MEM_FUNCTION_GEQ) | self.pm4.WAIT_REG_MEM_ENGINE(0)
+  def set_grbm_broadcast(self): self.wreg(self.gc.regGRBM_GFX_INDEX, **{f'{f}_broadcast_writes': 1 for f in ['se', 'sa', 'instance']})
+  def set_grbm_se(self, se): self.wreg(self.gc.regGRBM_GFX_INDEX, se_index=se, instance_broadcast_writes=1)
 
-    self.pkt3(self.pm4.PACKET3_WAIT_REG_MEM, wrm_info_dw, *(data64_le(mem) if mem is not None else (reg_req, reg_done)), value, mask, 4)
+  def wait_reg_mem(self, value, mask=0xffffffff, mem=None, reg=None, reg_done=0, op=WAIT_REG_MEM_FUNCTION_GEQ):
+    wrm_info_dw = self.pm4.WAIT_REG_MEM_MEM_SPACE(int(mem is not None)) | self.pm4.WAIT_REG_MEM_OPERATION(int(mem is None and reg_done > 0)) \
+                | self.pm4.WAIT_REG_MEM_FUNCTION(op) | self.pm4.WAIT_REG_MEM_ENGINE(0)
+
+    self.pkt3(self.pm4.PACKET3_WAIT_REG_MEM, wrm_info_dw, *(data64_le(mem) if mem is not None else (reg, reg_done)), value, mask, 4)
 
   def acquire_mem(self, addr=0x0, sz=(1 << 64)-1, gli=1, glm=1, glk=1, glv=1, gl1=1, gl2=1):
     if self.dev.target >= (10,0,0):
@@ -114,7 +117,7 @@ class AMDComputeQueue(HWQueue):
 
   def memory_barrier(self):
     pf = '' if self.nbio.version[0] == 2 else '0' if self.nbio.version[:2] != (7, 11) else '1'
-    self.wait_reg_mem(reg_req=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ').addr[0],
+    self.wait_reg_mem(reg=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_REQ').addr[0],
                       reg_done=getattr(self.nbio, f'regBIF_BX_PF{pf}_GPU_HDP_FLUSH_DONE').addr[0], value=0xffffffff)
     self.acquire_mem()
     return self
@@ -154,7 +157,8 @@ class AMDComputeQueue(HWQueue):
     self.spi_config(tracing=True)
     # One buffer for one SE, mesa does it with a single buffer and ac_sqtt_get_data_offset, but this is simpler and should work just as well
     for se in range(len(buf0s)):
-      self.wreg(self.gc.regGRBM_GFX_INDEX, se_index=se, instance_broadcast_writes=1)
+      self.set_grbm_se(se)
+
       buf0_lo, buf0_hi = data64_le(buf0s[se].va_addr >> 12)
       if self.dev.target >= (12,0,0):
         self.wreg(self.gc.regSQ_THREAD_TRACE_BUF0_SIZE, size=buf0s[se].size >> 12)
@@ -186,8 +190,8 @@ class AMDComputeQueue(HWQueue):
       self.wreg(self.gc.regSQ_THREAD_TRACE_TOKEN_MASK, reg_include=reg_include, token_exclude=token_exclude, bop_events_token_include=1, **token_mask)
       # Enable SQTT
       self.sqtt_config(tracing=True)
-    # Restore global broadcasting
-    self.wreg(self.gc.regGRBM_GFX_INDEX, se_broadcast_writes=1, sa_broadcast_writes=1, instance_broadcast_writes=1)
+
+    self.set_grbm_broadcast()
     self.wreg(self.gc.regCOMPUTE_THREAD_TRACE_ENABLE, 1)
     self.memory_barrier()
     return self
@@ -200,19 +204,18 @@ class AMDComputeQueue(HWQueue):
     self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.THREAD_TRACE_FINISH) | self.pm4.EVENT_INDEX(0))
     # For each SE wait for finish to complete and copy regSQ_THREAD_TRACE_WPTR to know where in the buffer trace data ends
     for se in range(ses):
-      self.wreg(self.gc.regGRBM_GFX_INDEX, se_index=se, instance_broadcast_writes=1)
-      # Wait for FINISH_PENDING==0
-      self.pkt3(self.pm4.PACKET3_WAIT_REG_MEM, self.pm4.WAIT_REG_MEM_FUNCTION(WAIT_REG_MEM_FUNCTION_EQ),
-                self.gc.regSQ_THREAD_TRACE_STATUS.addr[0], 0, 0, self.gc.regSQ_THREAD_TRACE_STATUS.fields_mask('finish_pending'), 4)
-      # Disable SQTT
+      self.set_grbm_se(se)
+
+      # Check if SQTT is stopped
+      status_reg = self.gc.regSQ_THREAD_TRACE_STATUS.addr[0]
+      self.wait_reg_mem(reg=status_reg, mask=self.gc.regSQ_THREAD_TRACE_STATUS.fields_mask('finish_pending'), op=WAIT_REG_MEM_FUNCTION_EQ, value=0)
       self.sqtt_config(tracing=False)
-      # Wait for BUSY==0
-      self.pkt3(self.pm4.PACKET3_WAIT_REG_MEM, self.pm4.WAIT_REG_MEM_FUNCTION(WAIT_REG_MEM_FUNCTION_EQ),
-                self.gc.regSQ_THREAD_TRACE_STATUS.addr[0], 0, 0, self.gc.regSQ_THREAD_TRACE_STATUS.fields_mask('busy'), 4)
+      self.wait_reg_mem(reg=status_reg, mask=self.gc.regSQ_THREAD_TRACE_STATUS.fields_mask('busy'), op=WAIT_REG_MEM_FUNCTION_EQ, value=0)
+
       # Copy WPTR to memory (src_sel = perf, dst_sel = tc_l2, wr_confirm = True)
       self.pkt3(self.pm4.PACKET3_COPY_DATA, 1 << 20 | 2 << 8 | 4, self.gc.regSQ_THREAD_TRACE_WPTR.addr[0], 0, *data64_le(wptrs.va_addr+(se*4)))
-    # Restore global broadcasting
-    self.wreg(self.gc.regGRBM_GFX_INDEX, se_broadcast_writes=1, sa_broadcast_writes=1, instance_broadcast_writes=1)
+
+    self.set_grbm_broadcast()
     self.spi_config(tracing=False)
     self.memory_barrier()
     return self
@@ -559,8 +562,6 @@ class KFDIface:
     id2ip = {am.GC_HWID: am.GC_HWIP, am.SDMA0_HWID: am.SDMA0_HWIP, am.NBIF_HWID: am.NBIF_HWIP}
     ip_hw = [(id2ip[int(hwid)], int(hwid)) for hwid in FileIOInterface(ip_base).listdir() if hwid.isnumeric() and int(hwid) in id2ip]
     self.ip_versions = {ip:tuple(int(FileIOInterface(f'{ip_base}/{hw}/0/{part}').read()) for part in ['major','minor','revision']) for ip,hw in ip_hw}
-    self.ip_offsets = {ip:{int(i):tuple(int(x, 16) for x in FileIOInterface(f'{ip_base}/{hw}/{i}/base_addr').read().splitlines())
-      for i in FileIOInterface(f'{ip_base}/{hw}').listdir()} for ip,hw in ip_hw }
     self.drm_fd = FileIOInterface(f"/dev/dri/renderD{self.props['drm_render_minor']}", os.O_RDWR)
 
     self.kfd_ver = ((ver_st:=kfd.AMDKFD_IOC_GET_VERSION(KFDIface.kfd)).major_version, ver_st.minor_version)
@@ -676,7 +677,7 @@ class PCIIface(PCIIfaceBase):
 
   def _setup_adev(self, name, vram:MMIOInterface, doorbell:MMIOInterface, mmio:MMIOInterface, dma_regions:list[tuple[int, MMIOInterface]]|None=None):
     self.dev_impl:AMDev = AMDev(name, vram, doorbell, mmio, dma_regions)
-    self.ip_offsets, self.ip_versions = self.dev_impl.regs_offset, self.dev_impl.ip_ver
+    self.ip_versions = self.dev_impl.ip_ver
 
     gfxver = int(f"{self.dev_impl.ip_ver[am.GC_HWIP][0]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][1]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][2]:02d}")
     array_count = self.dev_impl.gc_info.gc_num_sa_per_se * self.dev_impl.gc_info.gc_num_se
@@ -776,14 +777,15 @@ class AMDDevice(HCQCompiled):
     debug_memory_size = round_up((self.max_cu_id + 1 if self.target >= (10,1,0) else 1) * (self.max_wave_id + 1) * 32, 64)
     if self.target[0] == 10: ctl_stack_size = min(ctl_stack_size, 0x7000)
 
+    self.ip_off = import_ip_offsets(self.target)
     self.soc = import_soc(self.target)
     self.pm4 = importlib.import_module(f"tinygrad.runtime.autogen.am.pm4_{'nv' if self.target[0] >= 10 else 'soc15'}")
     self.sdma = import_module('sdma', min(self.iface.ip_versions[am.SDMA0_HWIP], (6, 0, 0)))
-    self.gc = AMDIP('gc', self.iface.ip_versions[am.GC_HWIP], self.iface.ip_offsets[am.GC_HWIP])
+    self.gc = AMDIP('gc', self.iface.ip_versions[am.GC_HWIP],
+                    bases={i: tuple(getattr(self.ip_off, f'GC_BASE__INST{i}_SEG{s}', 0) for s in range(6)) for i in range(6)})
 
-    nbio_name = 'nbio' if self.target[0] < 12 else 'nbif'
-    nbio_pad = (0,) if self.target[0] == 9 else ()
-    self.nbio = AMDIP(nbio_name, self.iface.ip_versions[am.NBIF_HWIP], {i:nbio_pad+x for i,x in self.iface.ip_offsets[am.NBIF_HWIP].items()})
+    self.nbio = AMDIP('nbio' if self.target[0] < 12 else 'nbif', self.iface.ip_versions[am.NBIF_HWIP],
+                      bases={i: tuple(getattr(self.ip_off, f'NBIO_BASE__INST{i}_SEG{s}', 0) for s in range(9)) for i in range(6)})
 
     self.is_aql = getenv("AMD_AQL", int(self.xccs > 1))
     if self.is_aql:

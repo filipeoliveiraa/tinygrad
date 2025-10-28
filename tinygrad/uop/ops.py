@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, Callable, cast, TYPE_CHECKING, Type, Sequence
+from typing import Any, Callable, cast, TYPE_CHECKING, Type, Sequence, Iterable
 import sys, time, functools, itertools, math, operator, hashlib, os, types, pickle, pathlib, inspect, weakref, collections
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -8,7 +8,7 @@ from tinygrad.uop.mathtraits import MathTrait
 from tinygrad.dtype import ConstType, ImageDType, dtypes, DType, truncate, PtrDType, least_upper_dtype, Invalid, InvalidType
 from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Context, partition, temp, unwrap, T, argfix, Metadata, flatten, TRACEMETA
 from tinygrad.helpers import PICKLE_BUFFERS, PROFILE, dedup, cdiv, cmod, diskcache_put, to_function_name, cpu_profile, TracingKey, VIZ, SPEC
-from tinygrad.helpers import strip_parens
+from tinygrad.helpers import strip_parens, colored
 if TYPE_CHECKING:
   from tinygrad.device import Buffer, MultiBuffer
 
@@ -16,6 +16,10 @@ class AxisType(Enum):
   def __repr__(self): return str(self)
   GLOBAL = auto(); WARP = auto(); LOCAL = auto(); LOOP = auto(); GROUP_REDUCE = auto(); REDUCE = auto(); UPCAST = auto(); UNROLL = auto() # noqa: E702
   THREAD = auto()
+axis_letters = {AxisType.GLOBAL: "g", AxisType.THREAD: "t", AxisType.LOCAL: "l", AxisType.WARP: "w", AxisType.LOOP: "L", AxisType.UPCAST: "u",
+                AxisType.GROUP_REDUCE: "G", AxisType.REDUCE: "R", AxisType.UNROLL: "r"}
+axis_colors = {AxisType.GLOBAL: "blue", AxisType.THREAD: "BLUE", AxisType.LOCAL: "cyan", AxisType.WARP: "CYAN", AxisType.LOOP: "WHITE",
+               AxisType.UPCAST: "yellow", AxisType.GROUP_REDUCE: "RED", AxisType.REDUCE: "red", AxisType.UNROLL: "magenta"}
 
 range_start = {Ops.BUFFERIZE: 1, Ops.REDUCE: 1, Ops.STORE: 2, Ops.WMMA: 3, Ops.END: 1}
 
@@ -40,7 +44,16 @@ def srender(x:sint) -> str: return x.render() if isinstance(x, UOp) else str(x)
 def ssimplify(uop:sint): return uop.ssimplify() if isinstance(uop, UOp) else uop
 def sym_infer(uop: UOp|int, var_vals: dict[str, int]) -> int: return uop.sym_infer(var_vals) if isinstance(uop, UOp) else uop
 
-def range_str(u:UOp) -> str: return '_'.join([str(x) if x >= 0 else "m"+str(-x) for x in u.arg[0:-1]])
+def range_str(u:UOp, color=False) -> str:
+  ret = '_'.join([str(x) if x >= 0 else "m"+str(-x) for x in u.arg[0:-1]])
+  return colored(ret, axis_colors[u.arg[-1]]) if color else ret
+
+def consumer_map_from_toposort(lst:Iterable[UOp]):
+  ret: dict[UOp, dict[UOp, None]] = {}
+  for u in lst:
+    ret[u] = {}
+    for s in u.src: ret[s][u] = None
+  return ret
 
 # used for UOp and UPat
 def pretty_print(x:Any, rep:Callable, srcfn=lambda x: x.src, cache=None, d=0)->str:
@@ -65,8 +78,8 @@ class UOpMetaClass(type):
       assert op is Ops.BUFFER, f"trying to set Buffer {_buffer} for {op}"
       buffers[created] = _buffer
     if SPEC > 1:
+      from tinygrad.uop.spec import full_spec, test_pyrender
       if SPEC > 2: test_pyrender(created)
-      from tinygrad.uop.spec import full_spec
       with Context(IGNORE_OOB=1): ret = full_spec.rewrite(created)
       if cast(bool|None, ret) is not True: raise RuntimeError(f"SPEC ISSUE {ret}: {created}")
     return created
@@ -145,12 +158,7 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     return ret
 
   # returns map of UOps to their consumers in the graph rooted by self
-  def get_consumer_map(self) -> dict[UOp, dict[UOp, None]]:
-    ret: dict[UOp, dict[UOp, None]] = {}
-    for u in self.toposort():
-      ret[u] = {}
-      for s in u.src: ret[s][u] = None
-    return ret
+  def get_consumer_map(self) -> dict[UOp, dict[UOp, None]]: return consumer_map_from_toposort(self.toposort())
 
   def reverse_toposort(self, consumer_map) -> dict[UOp, None]:
     ret: dict[UOp, None] = {}
@@ -369,13 +377,16 @@ class UOp(MathTrait, metaclass=UOpMetaClass):
     if op in {Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ}: out_dtype = dtypes.bool.vec(out_dtype.count) if out_dtype.count > 1 else dtypes.bool
     return UOp(op, out_dtype, (self,)+src, **kwargs)
   @staticmethod
-  def const(dtype:DType, b:ConstLike, device:str|tuple[str, ...]|None=None, shape:tuple[sint, ...]|None=None, src=None):
+  def const(dtype:DType, b:ConstLike, device:str|tuple[str, ...]|None=None, shape:tuple[sint, ...]|None=None, src=None, unique:bool|int=False):
     if isinstance(b, UOp): return b.unbind()[0] if b.op is Ops.BIND else b
     if isinstance(b, tuple) and all_same(b): b = b[0]  # doesn't have to be a VCONST if they are all the same
     # NOTE: float('nan') != float('nan'), so we canonicalize here
     if isinstance(b, float) and math.isnan(b): b = math.nan
     ret = UOp(Ops.VCONST if isinstance(b, tuple) else Ops.CONST, dtype, arg=dtypes.as_const(b, dtype), src=() if src is None else (src,))
-    if device is not None: ret = ret.replace(src=(UOp(Ops.DEVICE, arg=device),))
+    if device is not None:
+      if unique or not isinstance(unique, bool): ret = ret.replace(src=(UOp(Ops.DEVICE, arg=device), UOp.unique(None if unique is True else unique)))
+      else: ret = ret.replace(src=(UOp(Ops.DEVICE, arg=device),))
+    elif unique or not isinstance(unique, bool): raise RuntimeError("unique consts only with DEVICE")
     if shape is not None: ret = ret.reshape((1,)*len(shape)).expand(shape)
     return ret
   @staticmethod
@@ -859,6 +870,7 @@ class UPat(MathTrait):
   def fuse(self): return self.alu(Ops.FUSE)
   def broadcast(self, **kwargs): return UPat(Ops.VECTORIZE, self.dtype, src=self, **kwargs)
   def contiguous(self, *args, **kwargs): return UPat(Ops.CONTIGUOUS, dtype=self.dtype, src=(self,)+args, **kwargs)
+  def after(self, *src:UPat, **kwargs): return UPat(Ops.AFTER, self.dtype, (self,)+src, **kwargs)
 
   def const_like(self, b:ConstLike): return UPat.const(self.dtype, cast(ConstType, b))
   def alu(self, op:Ops, *src:UPat):
@@ -1237,6 +1249,7 @@ renderer_infer = PatternMatcher([
 
 # *** pyrender ***
 
+def srcs(ctx, src): return f"({ctx[src[0]]},)" if len(src) == 1 else f"({', '.join([ctx[x] for x in src])})"
 def render_marg(ctx,x:UOp):
   if x.op in {Ops.PERMUTE, Ops.FLIP}: return str(x.marg)
   pieces = []
@@ -1246,12 +1259,11 @@ def render_marg(ctx,x:UOp):
     pieces = [f"({ctx[a[0]] if isinstance(a[0], UOp) else str(a[0])}, {ctx[a[1]] if isinstance(a[1], UOp) else str(a[1])})" for a in x.marg]
   return f"({','.join(pieces)})" if len(pieces) != 1 else f"({pieces[0]},)"
 
-# TODO: use this more in pyrender
-def srcs(ctx, src): return f"({ctx[src[0]]},)" if len(src) == 1 else f"({', '.join([ctx[x] for x in src])})"
-
-sugar = {Ops.SINK, Ops.END, Ops.STORE, Ops.LOAD, Ops.UNIQUE, Ops.SQRT, Ops.INDEX, Ops.REDUCE, Ops.AFTER,
-         Ops.WHERE, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CONTIGUOUS, Ops.BARRIER}
+sugar = {Ops.SINK, Ops.END, Ops.STORE, Ops.LOAD, Ops.UNIQUE, Ops.SQRT, Ops.INDEX, Ops.REDUCE, Ops.AFTER, Ops.THREEFRY,
+         Ops.WHERE, Ops.RECIPROCAL, Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.CONTIGUOUS, Ops.BARRIER, Ops.ASSIGN, Ops.DETACH}
 pm_pyrender_extra = PatternMatcher([
+  (UPat(Ops.CONST, src=(UPat(Ops.DEVICE, name="d"), UPat(Ops.UNIQUE, name="u")), name="x"),
+   lambda x,d,u: f"UOp.const({x.dtype}, {x.arg}, device={repr(d.arg)}, unique={u.arg})"),
   (UPat(Ops.CONST, src=(UPat(Ops.DEVICE, name="d"),), name="x"), lambda x,d: f"UOp.const({x.dtype}, {x.arg}, device={repr(d.arg)})"),
   (UPat(Ops.CONST, name="x"), lambda x: f"UOp.const({x.dtype}, {x.arg})"),
   (UPat(Ops.DEFINE_VAR, src=(), name="x"), lambda x:
@@ -1265,9 +1277,7 @@ pm_pyrender_extra = PatternMatcher([
   # NOTE: range has srcs sometimes after control flow
   (UPat(Ops.RANGE, src=(UPat(Ops.CONST, name="c"),), allow_any_len=True, name="x"), lambda ctx,x,c:
     "UOp.range("+', '.join([str(c.arg)] + [str(y) for y in x.arg])+
-      (f', src={srcs(ctx, x.src[1:])}' if len(x.src) > 1 else '')+\
-      (', dtype='+str(x.dtype) if x.dtype is not dtypes.index else '')+\
-      (', tag='+str(x.tag) if x.tag is not None else '')+")"),
+      (f', src={srcs(ctx, x.src[1:])}' if len(x.src) > 1 else '')+(', dtype='+str(x.dtype) if x.dtype is not dtypes.index else '')+")"),
   # TODO: index shouldn't mismatch dtype
   (UPat(Ops.INDEX, src=(UPat(), UPat()), name="x"), lambda ctx,x:
    f"{ctx[x.src[0]]}.index({ctx[x.src[1]]}, dtype={x.dtype})" if x.src[0].dtype != x.dtype else None),
@@ -1280,32 +1290,27 @@ pm_pyrender_extra = PatternMatcher([
   # NOTE: sub doesn't work cause it's written as add/mul
   (UPat(set(syms.keys())-{Ops.SUB}, src=(UPat(name="y"), UPat(Ops.CONST, name="z")), name="x"), lambda ctx,x,y,z: f"({ctx[y]}{syms[x.op]}{z.arg})"),
   (UPat(set(syms.keys())-{Ops.SUB}, name="x"), lambda ctx,x: f"({ctx[x.src[0]]}{syms[x.op]}{ctx[x.src[1]]})"),
-  (UPat(sugar, src=(), name="x"), lambda x: f"UOp.{x.op.name.lower()}("+', '.join( \
-    ([f'arg={repr(x.arg)}'] if x.arg is not None else []) + ([f'tag={repr(x.tag)}'] if x.tag is not None else []))+")"),
+  (UPat(sugar, src=(), name="x"), lambda x: f"UOp.{x.op.name.lower()}("+', '.join(([f'arg={repr(x.arg)}'] if x.arg is not None else []))+")"),
   (UPat(sugar, name="x"), lambda ctx,x: f"{ctx[x.src[0]]}.{x.op.name.lower()}("+', '.join([ctx[y] for y in x.src[1:]] + \
-    ([f'arg={repr(x.arg)}'] if x.arg is not None else []) + ([f'tag={repr(x.tag)}'] if x.tag is not None else []))+")"),
+    ([f'arg={repr(x.arg)}'] if x.arg is not None else []))+")"),
 ])
 
 # NOTE: you can remove pm_pyrender_extra and it'll still be correct
 pm_pyrender = pm_pyrender_extra+PatternMatcher([
-  (UPat(Ops.KERNEL, name="u"), lambda ctx,u: "UOp(Ops.KERNEL, src="+', '.join( \
-    ([f"({ctx[u.src[0]]},)"] if len(u.src) == 1 else ([f"({', '.join([ctx[x] for x in u.src])})"] if len(u.src) > 1 else []))) + \
-    f", arg=Kernel({ctx[u.arg.ast]}(), {u.arg.metadata})"+(f", tag={repr(u.tag)}" if u.tag is not None else "")+")"),
-  (UPat(GroupOp.All, name="u"), lambda ctx,u: "UOp("+', '.join([str(u.op), str(u.dtype)] + \
-    ([f"({ctx[u.src[0]]},)"] if len(u.src) == 1 else ([f"({', '.join([ctx[x] for x in u.src])})"] if len(u.src) > 1 else [])) + \
-    ([f"arg={repr(u.arg)}"] if u.arg is not None else []) + ([f"tag={repr(u.tag)}"] if u.tag is not None else []))+")"),
+  (UPat(Ops.KERNEL, name="u"), lambda ctx,u: f"UOp(Ops.KERNEL, src={srcs(ctx,u.src)}, arg=Kernel({ctx[u.arg.ast]}(), {u.arg.metadata}))"),
+  (UPat(GroupOp.All, name="u"), lambda ctx,u: f"UOp({u.op}, {u.dtype}, {srcs(ctx,u.src)}"+(f", {repr(u.arg)})" if u.arg is not None else ")")),
 ])
 
 def pyrender(ast:UOp) -> str:
-  cmap = ast.get_consumer_map()
-  uops = list(ast.toposort())
-  ret: dict[str, str] = {}
-  r: dict[UOp, str] = {}
+  lst = list(ast.toposort())
 
+  cmap = consumer_map_from_toposort(lst)
   not_rendered = {Ops.CONST, Ops.VCONST, Ops.DEVICE}
-  always_rendered = {Ops.DEFINE_GLOBAL, Ops.LOAD, Ops.SPECIAL, Ops.RANGE, Ops.CONTIGUOUS, Ops.BUFFER, Ops.COPY, Ops.KERNEL, Ops.WHERE, Ops.END}
+  always_rendered = {Ops.DEFINE_GLOBAL, Ops.LOAD, Ops.SPECIAL, Ops.RANGE, Ops.CONTIGUOUS, Ops.VECTORIZE,
+                     Ops.BUFFER, Ops.COPY, Ops.KERNEL, Ops.WHERE, Ops.END, Ops.ASSIGN}
+
   to_render: set[UOp] = {ast}
-  for u in uops:
+  for u in lst:
     if u.op in {Ops.SINK}:
       for s in u.src: to_render.add(s)
     if u.op is Ops.STORE: to_render.add(u.src[1])
@@ -1316,37 +1321,21 @@ def pyrender(ast:UOp) -> str:
     to_render.add(u)
 
   kernels: dict[UOp, tuple[str, str]] = {}
-  for i,u in enumerate(uops):
+  r: dict[UOp, str] = {}
+  ret: dict[str, str] = {}
+  for i,u in enumerate(lst):
     if u.op is Ops.KERNEL:
       if u.arg.ast not in kernels:
         kernels[u.arg.ast] = (f"k{len(kernels)}", f"def k{len(kernels)}():\n  " + pyrender(u.arg.ast).replace('\n', '\n  ') + "\n  return ast\n\n")
       r[u.arg.ast] = kernels[u.arg.ast][0]
     ren = cast(str, pm_pyrender.rewrite(u, ctx=r))
     assert isinstance(ren, str)
-    #if u.tag is not None: ren += f".rtag({u.tag})"
+    if u.tag is not None: ren += f".rtag({u.tag})"
     if u not in to_render: r[u] = ren
     else:
-      r[u] = f"c{i}" if u is not uops[-1] else "ast"
+      r[u] = f"c{i}" if u is not lst[-1] else "ast"
       ret[r[u]] = ren
   return ''.join([v[1] for v in kernels.values()]) + '\n'.join([f"{k} = {v}" for k,v in ret.items()])
-
-def eval_pyrender(code:str) -> UOp:
-  from tinygrad.dtype import AddrSpace
-  from tinygrad.codegen.opt import Opt, OptOps
-  from tinygrad.schedule.rangeify import BufferizeOpts, Kernel
-  lcls:dict[str, Any] = {"inf": math.inf, "nan": math.nan, "KernelInfo": KernelInfo, "Kernel": Kernel,
-                         "Opt": Opt, "OptOps": OptOps, "BufferizeOpts": BufferizeOpts, "AddrSpace": AddrSpace}
-  exec(code, None, lcls)
-  return lcls['ast']
-
-def test_pyrender(test_ast:UOp, check_parents=True):
-  code = pyrender(test_ast)
-  ast:UOp = eval_pyrender(code)
-  if ast is not test_ast:
-    if check_parents:
-      for u in test_ast.toposort(): test_pyrender(u, check_parents=False)
-    raise RuntimeError(f"PYRENDER ISSUE:\nSTR MATCH: {str(test_ast) == str(ast)}\nUOP:\n{test_ast}\nPRODUCED:\n{ast}\nCODE:\n{code}")
-  return code
 
 # *** what was symbolic.py ***
 

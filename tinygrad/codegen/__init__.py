@@ -1,6 +1,6 @@
 from typing import cast
 from tinygrad.helpers import QUANTIZE, DEVECTORIZE, TRANSCENDENTAL, SPEC
-from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, pm_lower_index_dtype, test_pyrender, Ops, UPat
+from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, pm_lower_index_dtype, Ops, UPat
 from tinygrad.uop.spec import type_verify, program_spec, kernel_spec
 from tinygrad.renderer import Renderer
 from tinygrad.dtype import dtypes
@@ -15,15 +15,14 @@ from tinygrad.codegen.late.expander import migrate_indexing, expander, pm_pre_ex
 from tinygrad.codegen.late.devectorizer import load_store_folding, load_store_indexing, devectorize, pm_reduce, \
   ReduceContext, correct_load_store, pm_render
 from tinygrad.codegen.opt.postrange import apply_opts
-from tinygrad.codegen.simplify import pm_simplify_ranges, pm_flatten_range, pm_split_ranges, pm_load_collapse
+from tinygrad.codegen.simplify import pm_simplify_ranges, pm_flatten_range, pm_split_ranges, pm_load_collapse, pm_split_store
 from tinygrad.schedule.rangeify import pm_add_buffers_local, rangeify_codegen
-from tinygrad.codegen.late.control_flow import CFGContext, pm_split_ends, pm_add_control_flow, linearize
+from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
 
 def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -> UOp:
   if ren is None: ren = Renderer()
 
-  if SPEC: type_verify(list(sink.toposort()), kernel_spec)
-  if SPEC > 1: test_pyrender(sink)
+  if SPEC: type_verify(sink, kernel_spec)
 
   # first we optimize
   if optimize:
@@ -43,6 +42,9 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -
 
     # optimize (schedule) the AST
     sink = graph_rewrite(sink, pm_simplify_ranges, name="simplify ranges")
+
+    # split store range (only on CPU for now)
+    sink = graph_rewrite(sink, pm_split_store, ctx=ren.device, name="cut store ranges")
 
     # do postrange optimization, BEAM or hand_coded_optimizations
     sink = apply_opts(sink, ren)
@@ -90,7 +92,6 @@ def full_rewrite_to_sink(sink:UOp, ren:Renderer|None=None, optimize:bool=True) -
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
 
   # return the rewritten sink
-  if SPEC > 1: test_pyrender(sink)
   return sink
 
 # inject IF/ENDIF. only needed if device doesn't support gated stores

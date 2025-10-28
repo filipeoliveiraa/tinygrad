@@ -70,9 +70,9 @@ const drawGraph = (data) => {
   nodes.selectAll("rect").data(d => [d]).join("rect").attr("width", d => d.width).attr("height", d => d.height).attr("fill", d => d.color)
     .attr("x", d => -d.width/2).attr("y", d => -d.height/2);
   const STROKE_WIDTH = 1.4;
-  const labels = nodes.selectAll("g.label").data(d => [d]).join("g").attr("class", "label").attr("transform", d => {
-    return d.labelWidth != null ? `translate(-${d.labelWidth/2}, -${d.labelHeight/2+STROKE_WIDTH*2})` : null;
-  });
+  const labels = nodes.selectAll("g.label").data(d => [d]).join("g").attr("class", "label");
+  const hasLabelDims = data.nodes[0]?.value.labelWidth != null;
+  if (hasLabelDims) labels.attr("transform", d => `translate(-${d.labelWidth/2}, -${d.labelHeight/2+STROKE_WIDTH*2})`);
   labels.selectAll("text").data(d => {
     const ret = [[]];
     for (const { st, color } of parseColors(d.label, defaultColor="initial")) {
@@ -83,6 +83,11 @@ const drawGraph = (data) => {
     return [ret];
   }).join("text").selectAll("tspan").data(d => d).join("tspan").attr("x", "0").attr("dy", 14).selectAll("tspan").data(d => d).join("tspan")
     .attr("fill", d => darkenHex(d.color, 25)).text(d => d.st).attr("xml:space", "preserve");
+  // recenter after drawing texts if needed
+  if (!hasLabelDims) labels.attr("transform", (_,i,els) => {
+    const b = els[i].getBBox();
+    return `translate(${-b.x-b.width/2}, ${-b.y-b.height/2})`
+  });
   addTags(nodes.selectAll("g.tag").data(d => d.tag != null ? [d] : []).join("g").attr("class", "tag")
     .attr("transform", d => `translate(${-d.width/2+8}, ${-d.height/2+8})`).datum(e => e.tag));
   // draw edges
@@ -94,21 +99,6 @@ const drawGraph = (data) => {
     points.push(intersectRect(g.node(e.w), points[points.length-1]));
     return line(points);
   }).attr("marker-end", "url(#arrowhead)");
-  addTags(d3.select("#edge-labels").selectAll("g").data(edges).join("g").attr("transform", (e) => {
-    // get a point near the end
-    const [p1, p2] = g.edge(e).points.slice(-2);
-    const dx = p2.x-p1.x;
-    const dy = p2.y-p1.y;
-    // normalize to the unit vector
-    const len = Math.sqrt(dx*dx + dy*dy);
-    const ux = dx / len;
-    const uy = dy / len;
-    // avoid overlap with the arrowhead
-    const offset = 17;
-    const x = p2.x - ux * offset;
-    const y = p2.y - uy * offset;
-    return `translate(${x}, ${y})`
-  }).attr("class", e => g.edge(e).label.type).attr("id", e => `${e.v}-${e.w}`).datum(e => g.edge(e).label.text));
 }
 
 // ** UOp graph
@@ -129,6 +119,21 @@ function renderDag(graph, additions, recenter) {
     displaySelection("#graph");
     updateProgress({ start:false });
     drawGraph(e.data);
+    addTags(d3.select("#edge-labels").selectAll("g").data(e.data.edges).join("g").attr("transform", (e) => {
+      // get a point near the end
+      const [p1, p2] = e.value.points.slice(-2);
+      const dx = p2.x-p1.x;
+      const dy = p2.y-p1.y;
+      // normalize to the unit vector
+      const len = Math.sqrt(dx*dx + dy*dy);
+      const ux = dx / len;
+      const uy = dy / len;
+      // avoid overlap with the arrowhead
+      const offset = 17;
+      const x = p2.x - ux * offset;
+      const y = p2.y - uy * offset;
+      return `translate(${x}, ${y})`
+    }).attr("class", e => e.value.label.type).attr("id", e => `${e.v}-${e.w}`).datum(e => e.value.label.text));
     if (recenter) document.getElementById("zoom-to-fit-btn").click();
   };
 }

@@ -32,6 +32,20 @@ def custom_gemm(C:UOp, A:UOp, B:UOp) -> UOp:
   prog = C.end(i, j)
   return prog.sink(arg=KernelInfo(name=f"custom_gemm_{C.shape[0]}_{C.shape[1]}_{A.shape[1]}", opts_to_apply=()))
 
+def custom_sum(B:UOp, A:UOp) -> UOp:
+  i = UOp.range(A.shape[0], 0, axis_type=AxisType.REDUCE)
+  B = B[0].set(0.0)
+  B = B[0].set(B.after(i)[0] + A[i], end=i)
+  return B.sink(arg=KernelInfo(name=f"custom_sum_{A.shape[0]}", opts_to_apply=()))
+
+def flip_contract_kernel(dest:UOp, src:UOp):
+  assert dest.size%4 == 0
+  i = UOp.range(dest.size//4, 0)
+  j = UOp.range(4, 1, AxisType.UPCAST)
+  vec = src[i*4+j].contract(j)
+  store = UOp.group(*[dest[i*4+k].store(vec.gep(3-k)) for k in range(4)])
+  return store.end(i).sink(arg=KernelInfo(name=f"flip_contract_{dest.size}", opts_to_apply=()))
+
 # **** backward callbacks ****
 
 def backward_gemm(gradient:UOp, kernel:UOp) -> tuple[UOp, UOp]:
@@ -77,12 +91,25 @@ class TestCustomKernel(unittest.TestCase):
     tst = tst.custom_kernel(fxn=custom_arange_kernel)[0]
     self.assertTrue((ref == tst).all().item())
 
+  def test_flip_contract(self):
+    a = Tensor.randn(10,4)
+    b = Tensor.empty_like(a)
+    b = b.custom_kernel(a, fxn=flip_contract_kernel)[0]
+    self.assertTrue((a.flip(1) == b).all().item())
+
   def test_noncontig(self):
     a = Tensor.ones(16, 16).contiguous()
     tst = Tensor.empty_like(a)
     b = a+1
     b_p1 = Tensor.custom_kernel(tst, b, fxn=custom_add_one_kernel)[0]
     self.assertTrue((b_p1 == 3).all().item())
+
+  def test_sum(self):
+    # TODO: this only works for float, and silently fails with int
+    a = Tensor([1.0, 2, 3, 4, 5])
+    tst = Tensor.empty(1)
+    b = Tensor.custom_kernel(tst, a, fxn=custom_sum)[0]
+    self.assertEqual(b.item(), 15)
 
   def test_gemm(self):
     N = 16

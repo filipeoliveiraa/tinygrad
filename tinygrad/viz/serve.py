@@ -18,7 +18,7 @@ uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", 
                Ops.RANGE: "#c8a0e0", Ops.ASSIGN: "#909090", Ops.BARRIER: "#ff8080", Ops.IF: "#c8b0c0", Ops.SPECIAL: "#c0c0ff",
                Ops.INDEX: "#cef263", Ops.WMMA: "#efefc0", Ops.MULTI: "#f6ccff", Ops.KERNEL: "#3e7f55",
                **{x:"#D8F9E4" for x in GroupOp.Movement}, **{x:"#ffffc0" for x in GroupOp.ALU}, Ops.THREEFRY:"#ffff80",
-               Ops.BUFFER_VIEW: "#E5EAFF", Ops.BUFFER: "#B0BDFF", Ops.COPY: "#a040a0", Ops.FUSE: "#FFa500",
+               Ops.BUFFER_VIEW: "#E5EAFF", Ops.BUFFER: "#B0BDFF", Ops.COPY: "#a040a0",
                Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0", Ops.CONTIGUOUS: "#FFC14D",
                Ops.BUFFERIZE: "#FF991C", Ops.REWRITE_ERROR: "#ff2e2e", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
 
@@ -193,10 +193,26 @@ def mem_layout(dev_events:list[tuple[int, int, float, DevEvent]], start_ts:int, 
   peaks.append(peak)
   return struct.pack("<BIQ", 1, len(events), peak)+b"".join(events) if events else None
 
+def load_sqtt(profile:list[ProfileEvent]) -> None:
+  from extra.sqtt.roc import decode
+  rctx = decode(profile)
+  steps = [{"name":x[0], "depth":0, "data":{"rows":[(e.inst, e.hit, e.lat, e.stall, str(e.typ).split("_")[-1]) for e in x[1].values()],
+                                            "cols":["Instruction", "Hit Count", "Latency", "Stall", "Type"], "summary":[]},
+            "query":f"/render?ctx={len(ctxs)}&step={i}&fmt=counters"} for i,x in enumerate(rctx.wave_events.items())]
+  if steps: ctxs.append({"name":"Counters", "steps":steps})
+
 def get_profile(profile:list[ProfileEvent]) -> bytes|None:
   # start by getting the time diffs
   for ev in profile:
     if isinstance(ev,ProfileDeviceEvent): device_ts_diffs[ev.device] = (ev.comp_tdiff, ev.copy_tdiff if ev.copy_tdiff is not None else ev.comp_tdiff)
+  # load device specific counters
+  device_decoders:dict[str, Callable[[list[ProfileEvent]], None]] = {}
+  for device in device_ts_diffs:
+    d = device.split(":")[0]
+    if d == "AMD": device_decoders[d] = load_sqtt
+  for fxn in device_decoders.values():
+    try: fxn(profile)
+    except Exception: continue
   # map events per device
   dev_events:dict[str, list[tuple[int, int, float, DevEvent]]] = {}
   markers:list[ProfilePointEvent] = []
@@ -248,7 +264,8 @@ def get_stdout(f:Callable) -> str:
   with redirect_stdout(buf:=io.StringIO()): f()
   return buf.getvalue()
 
-def get_render(i:int, fmt:str) -> dict|None:
+def get_render(i:int, j:int, fmt:str) -> dict|None:
+  if fmt == "counters": return ctxs[i]["steps"][j]["data"]
   if not isinstance(prg:=trace.keys[i].ret, ProgramSpec): return None
   if fmt == "uops": return {"src":get_stdout(lambda: print_uops(prg.uops or [])), "lang":"python"}
   if fmt == "src": return {"src":prg.src, "lang":"cpp"}
@@ -264,7 +281,7 @@ def get_render(i:int, fmt:str) -> dict|None:
 
 # ** HTTP server
 
-def get_int(query:dict[str, list[str]], k:str) -> int: return int(query[k][0])
+def get_int(query:dict[str, list[str]], k:str) -> int: return int(query.get(k,["0"])[0])
 
 class Handler(BaseHTTPRequestHandler):
   def do_GET(self):
@@ -279,7 +296,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path.endswith(".css"): content_type = "text/css"
       except FileNotFoundError: status_code = 404
     elif (query:=parse_qs(url.query)):
-      if url.path == "/render": ret, content_type = json.dumps(get_render(get_int(query, "ctx"), query["fmt"][0])).encode(), "application/json"
+      if url.path == "/render":
+        render_src = get_render(get_int(query, "ctx"), get_int(query, "step"), query["fmt"][0])
+        ret, content_type = json.dumps(render_src).encode(), "application/json"
       else:
         try: return self.stream_json(get_full_rewrite(trace.rewrites[i:=get_int(query, "ctx")][get_int(query, "idx")], i))
         except (KeyError, IndexError): status_code = 404

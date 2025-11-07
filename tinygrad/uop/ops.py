@@ -8,7 +8,7 @@ from tinygrad.mixin import OpMixin
 from tinygrad.dtype import ConstType, ImageDType, dtypes, DType, truncate, PtrDType, least_upper_dtype, Invalid, InvalidType, AddrSpace
 from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Context, partition, temp, unwrap, T, argfix, Metadata, flatten, TRACEMETA
 from tinygrad.helpers import PICKLE_BUFFERS, PROFILE, dedup, cdiv, cmod, diskcache_put, to_function_name, cpu_profile, TracingKey, VIZ, SPEC, CI
-from tinygrad.helpers import strip_parens, colored
+from tinygrad.helpers import strip_parens, colored, ansilen
 if TYPE_CHECKING:
   from tinygrad.device import Buffer, MultiBuffer
 
@@ -47,6 +47,11 @@ def sym_infer(uop: UOp|int, var_vals: dict[str, int]) -> int: return uop.sym_inf
 def range_str(u:UOp, color=False) -> str:
   ret = '_'.join([str(x) if x >= 0 else "m"+str(-x) for x in u.arg[0:-1]])
   return colored(ret, axis_colors[u.arg[-1]]) if color else ret
+
+def multirange_str(rngs:Iterable[UOp], color=False, pad=None) -> str:
+  ret = ','.join([range_str(x, color=color) for x in sorted(rngs, key=lambda x: x.arg)])
+  if pad is not None: ret += " " * (pad-ansilen(ret))
+  return ret
 
 def consumer_map_from_toposort(lst:Iterable[UOp]):
   ret: dict[UOp, dict[UOp, None]] = {}
@@ -295,14 +300,20 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def _ranges(self) -> dict[UOp, None]:
     ret: dict[UOp, None] = {}
     for s in self.src: ret.update(s.ranges)
-    if (er:=self.ended_ranges):
-      for s in UOp.sink(*er).ranges:
-        if s in ret: del ret[s]
+    for er in self.ended_ranges:
+      if er.op is Ops.RANGE:
+        # if it's a single RANGE, we don't flow through it.
+        if er in ret: del ret[er]
+      else:
+        # if it's not a RANGE, we include all ranges in srcs.
+        # technically we shouldn't flow through these ranges either, but this is pre pm_add_control_flow so it's the same.
+        for s in er.ranges:
+          if s in ret: del ret[s]
     return ret
 
   @property
   def ranges(self) -> dict[UOp, None]:
-    if self.op is Ops.RANGE: return {self:None}
+    if self.op is Ops.RANGE: return {self:None} | self._ranges
     return self._ranges
 
   # *** uop evaluation ***
@@ -845,9 +856,10 @@ def exec_alu(op:Ops, dtype:DType, operands, truncate_output=True):
 # ***** uop helpers *****
 
 def print_uops(uops:list[UOp]):
+  uops_index = {u:i for i,u in enumerate(uops)}
   for i,u in enumerate(uops):
-    formatted_srcs = [(uops.index(x) if x.op is not Ops.CONST else f"{x.arg}") if x in uops else "--" for x in u.src]
-    print(f"{i:4d} {str(u.op):20s}: {str(u.dtype):40s} " f"{str(formatted_srcs):32s} {u.arg}")
+    formatted_srcs = [(uops_index[x] if x.op is not Ops.CONST else f"{x.arg}") if x in uops else "--" for x in u.src]
+    print(f"{i:4d} {str(u.op):20s}: {multirange_str(u.ranges, color=True, pad=10)} {str(u.dtype):40s} " f"{str(formatted_srcs):32s} {u.arg}")
 
 # ***** pattern matcher *****
 

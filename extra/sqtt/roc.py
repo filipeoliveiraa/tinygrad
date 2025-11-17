@@ -1,5 +1,5 @@
 import ctypes, pathlib, argparse, pickle, re, functools, dataclasses, itertools
-from tinygrad.helpers import temp, unwrap, DEBUG
+from tinygrad.helpers import temp, unwrap, DEBUG, ProfileRangeEvent
 from tinygrad.device import ProfileEvent, ProfileDeviceEvent, ProfileProgramEvent
 from tinygrad.runtime.ops_amd import ProfileSQTTEvent, ProfilePMCEvent
 from tinygrad.runtime.autogen import llvm, rocprof
@@ -41,13 +41,15 @@ class WaveExec:
   wave_id:int
   cu:int
   simd:int
+  se:int
   begin_time:int
   end_time:int
   insts:list[InstExec]
 
 class _ROCParseCtx:
-  def __init__(self, dev_evs:dict[str, ProfileDeviceEvent], sqtt_evs:list[ProfileSQTTEvent], prog_evs:list[ProfileProgramEvent]):
-    self.dev_evs, self.sqtt_evs, self.prog_evs = dev_evs, iter(sqtt_evs), prog_evs
+  def __init__(self, dev_evs:dict[str, ProfileDeviceEvent], exec_evs:dict[int, ProfileRangeEvent], sqtt_evs:list[ProfileSQTTEvent],
+               prog_evs:list[ProfileProgramEvent]):
+    self.dev_evs, self.exec_evs, self.sqtt_evs, self.prog_evs = dev_evs, exec_evs, iter(sqtt_evs), prog_evs
     self.disasms:dict[tuple[str, int], tuple[str, int]] = {}
     self.inst_execs:dict[str, list[WaveExec]] = {}
 
@@ -61,6 +63,7 @@ class _ROCParseCtx:
     self.active_kern = x.kern if x is not None else None
     self.active_se = x.se if x is not None else None
     self.active_blob = (ctypes.c_ubyte * len(x.blob)).from_buffer_copy(x.blob) if x is not None else None
+    self.active_range = self.exec_evs[x.exec_tag] if x is not None else None
     return self.active_blob
 
   def on_occupancy_ev(self, ev:rocprof.rocprofiler_thread_trace_decoder_occupancy_t):
@@ -78,18 +81,21 @@ class _ROCParseCtx:
       if DEBUG >= 8: print(inst_execs[-1])
 
     if ev.instructions_size > 0:
-      self.inst_execs.setdefault(unwrap(self.active_kern), []).append(WaveExec(ev.wave_id, ev.cu, ev.simd, ev.begin_time, ev.end_time, inst_execs))
+      self.inst_execs.setdefault(unwrap(self.active_kern), []).append(WaveExec(ev.wave_id, ev.cu, ev.simd, unwrap(self.active_se), ev.begin_time,
+                                                                               ev.end_time, inst_execs))
 
 def decode(profile:list[ProfileEvent]) -> _ROCParseCtx:
   dev_events:dict[str, ProfileDeviceEvent] = {}
+  exec_events:dict[int, ProfileRangeEvent] = {}
   sqtt_events:list[ProfileSQTTEvent] = []
   prog_events:list[ProfileProgramEvent] = []
   for e in profile:
+    if isinstance(e, ProfileRangeEvent) and e.device.startswith("AMD"): exec_events[e.tag] = e
     if isinstance(e, ProfileDeviceEvent): dev_events[e.device] = e
     if isinstance(e, ProfileSQTTEvent): sqtt_events.append(e)
     if isinstance(e, ProfileProgramEvent) and e.device.startswith("AMD"): prog_events.append(e)
 
-  ROCParseCtx = _ROCParseCtx(dev_events, sqtt_events, prog_events)
+  ROCParseCtx = _ROCParseCtx(dev_events, exec_events, sqtt_events, prog_events)
 
   @rocprof.rocprof_trace_decoder_se_data_callback_t
   def copy_cb(buf, buf_size, data_ptr):
@@ -111,7 +117,6 @@ def decode(profile:list[ProfileEvent]) -> _ROCParseCtx:
 
   @rocprof.rocprof_trace_decoder_isa_callback_t
   def isa_cb(instr_ptr, mem_size_ptr, size_ptr, pc, data_ptr):
-    if DEBUG >= 8: print(f"isa_cb {pc.address=} {pc.code_object_id=}")
     instr, mem_size_ptr[0] = ROCParseCtx.disasms[(unwrap(ROCParseCtx.active_kern), pc.address)]
 
     # this is the number of bytes to next instruction, set to 0 for end_pgm

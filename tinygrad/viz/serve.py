@@ -236,8 +236,8 @@ def load_sqtt(profile:list[ProfileEvent]) -> None:
       if (u:=w.wave_loc) not in inst_units: inst_units[u] = itertools.count(0)
       n = next(inst_units[u])
       if (events:=cu_events.get(w.cu_loc)) is None: cu_events[w.cu_loc] = events = []
-      events.append(ProfileRangeEvent(w.simd_loc, f"INST WAVE:{w.wave_id} N:{n}", Decimal(w.begin_time), Decimal(w.end_time)))
-      wave_insts.setdefault(w.cu_loc, {})[f"{u} N:{n}"] = {"wave":w, "disasm":disasm, "run_number":n}
+      events.append(ProfileRangeEvent(w.simd_loc, loc:=f"INST WAVE:{w.wave_id} N:{n}", Decimal(w.begin_time), Decimal(w.end_time)))
+      wave_insts.setdefault(w.cu_loc, {})[f"{u} N:{n}"] = {"wave":w, "disasm":disasm, "run_number":n, "loc":loc}
     # occupancy events
     units:dict[str, itertools.count] = {}
     wave_start:dict[str, int] = {}
@@ -258,13 +258,15 @@ def load_sqtt(profile:list[ProfileEvent]) -> None:
       steps.append(create_step(cu, ("/counters", len(ctxs), len(steps)),
                                {"value":get_profile(events, sort_fn=row_tuple), "content_type":"application/octet-stream"}, depth=2))
       for k in sorted(wave_insts.get(cu, []), key=row_tuple):
-        steps.append(create_step(k.replace(cu, ""), ("/sqtt-insts", len(ctxs), len(steps)), wave_insts[cu][k], depth=3))
+        data = wave_insts[cu][k]
+        steps.append(create_step(k.replace(cu, ""), ("/sqtt-insts", len(ctxs), len(steps)), data, loc=data["loc"], depth=3))
   ctxs.append({"name":"Counters", "steps":steps})
 
-def device_sort_fn(k):
-  order = {"USER": 0, "TINY": 1}
-  dname, *rest = k.split()
-  return order.get(dname, len(order)+len(rest))
+def device_sort_fn(k:str) -> tuple[int, str, int]:
+  order = {"USER": 0, "TINY": 1, "DISK": 999}
+  dname = k.split()[0]
+  dev_rank = next((v for k,v in order.items() if dname.startswith(k)), len(order))
+  return (dev_rank, dname, len(k))
 
 def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_sort_fn) -> bytes|None:
   # start by getting the time diffs
@@ -292,12 +294,12 @@ def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_
   scache:dict[str, int] = {}
   peaks:list[int] = []
   dtype_size:dict[str, int] = {}
-  for k in sorted(dev_events, key=sort_fn):
-    (v:=dev_events[k]).sort(key=lambda e:e[0])
+  for k,v in dev_events.items():
+    v.sort(key=lambda e:e[0])
     layout[k] = timeline_layout(v, start_ts, scache)
     layout[f"{k} Memory"] = mem_layout(v, start_ts, unwrap(end_ts), peaks, dtype_size, scache)
-  groups = layout.items() if sort_fn is not None else sorted(layout.items(), key=lambda x: '' if len(ss:=x[0].split(" ")) == 1 else ss[1])
-  ret = [b"".join([struct.pack("<B", len(k)), k.encode(), v]) for k,v in groups if v is not None]
+  sorted_layout = sorted([k for k,v in layout.items() if v is not None], key=sort_fn)
+  ret = [b"".join([struct.pack("<B", len(k)), k.encode(), unwrap(layout[k])]) for k in sorted_layout]
   index = json.dumps({"strings":list(scache), "dtypeSize":dtype_size, "markers":[{"ts":int(e.ts-start_ts), **e.arg} for e in markers]}).encode()
   return struct.pack("<IQII", unwrap(end_ts)-start_ts, max(peaks,default=0), len(index), len(ret))+index+b"".join(ret)
 

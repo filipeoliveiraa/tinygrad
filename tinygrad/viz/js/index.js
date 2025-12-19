@@ -757,8 +757,8 @@ async function main() {
   if (ckey in cache) {
     ret = cache[ckey];
   }
-  // ** Disassembly view
-  if (!ckey.startsWith("/rewrites")) {
+  // ** Text view
+  if (!ckey.startsWith("/graph")) {
     if (!(ckey in cache)) cache[ckey] = ret = await fetchValue(ckey);
     if (ret.steps?.length > 0) {
       const el = select(state.currentCtx, state.currentStep);
@@ -822,8 +822,8 @@ async function main() {
     });
     return document.querySelector("#custom").replaceChildren(root.node());
   }
-  // ** UOp view (default)
-  // if we don't have a complete cache yet we start streaming rewrites in this step
+  // ** Graph view
+  // if we don't have a complete cache yet we start streaming graphs in this step
   if (!(ckey in cache) || (cache[ckey].length !== step.match_count+1 && activeSrc == null)) {
     ret = [];
     cache[ckey] = ret;
@@ -841,45 +841,47 @@ async function main() {
     };
   }
   if (ret.length === 0) return;
-  // ** center UOp graph
-  const render = (opts) => renderDag(ret[currentRewrite].graph, ret[currentRewrite].changed_nodes ?? [], currentRewrite === 0, opts);
+  // ** center graph
+  const data = ret[currentRewrite];
+  const render = (opts) => renderDag(data.graph, data.changed_nodes ?? [], currentRewrite === 0, opts);
   render({ showIndexing:toggle.checked });
   toggle.onchange = (e) => render({ showIndexing:e.target.checked });
-  // ** right sidebar code blocks
-  const codeElement = codeBlock(ret[currentRewrite].uop, "python", { wrap:false });
-  metadata.replaceChildren(toggleLabel, codeBlock(step.code_line, "python", { loc:step.loc, wrap:true }), codeElement);
+  // ** right sidebar metadata
+  metadata.innerHTML = "";
+  if (ckey.includes("rewrites")) metadata.appendChild(toggleLabel);
+  if (step.code_line != null) metadata.appendChild(codeBlock(step.code_line, "python", { loc:step.loc, wrap:true }));
   if (step.trace) {
     const trace = d3.create("pre").append("code").classed("hljs", true);
     for (let i=step.trace.length-1; i>=0; i--) {
       const [fp, lineno, fn, code] = step.trace[i];
       trace.append("div").style("margin-bottom", "2px").style("display","flex").text(fn+" ").append(() => pathLink(fp, lineno).node());
       trace.append("div").html(hljs.highlight(code, { language: "python" }).value).style("margin-bottom", "1ex");
+      metadata.appendChild(trace.node().parentNode);
     }
-    metadata.insertBefore(trace.node().parentNode, codeElement);
   }
-  // ** rewrite steps
-  if (step.match_count >= 1) {
-    const rewriteList = metadata.appendChild(document.createElement("div"));
-    rewriteList.className = "rewrite-list";
-    for (let s=0; s<=step.match_count; s++) {
-      const ul = rewriteList.appendChild(document.createElement("ul"));
-      ul.id = `rewrite-${s}`;
-      const p = ul.appendChild(document.createElement("p"));
-      p.innerText = s;
-      ul.onclick = () => setState({ currentRewrite:s });
-      ul.className = s > ret.length-1 ? "disabled" : s === currentRewrite ? "active" : "";
-      if (s > 0 && s === currentRewrite) {
-        const { upat, diff } = ret[s];
-        metadata.appendChild(codeBlock(upat[1], "python", { loc:upat[0], wrap:true }));
-        const diffCode = metadata.appendChild(document.createElement("pre")).appendChild(document.createElement("code"));
-        for (const line of diff) {
-          diffCode.appendChild(colored([{st:line, color:line.startsWith("+") ? "#3aa56d" : line.startsWith("-") ? "#d14b4b" : "#f0f0f5"}]));
-          diffCode.appendChild(document.createElement("br"));
-        }
-        diffCode.className = "wrap";
+  if (data.uop != null) metadata.appendChild(codeBlock(data.uop, "python", { wrap:false })).classList.toggle("full-height", step.match_count === 0);
+  // ** multi graph in one page
+  if (!step.match_count) return;
+  const rewriteList = metadata.appendChild(document.createElement("div"));
+  rewriteList.className = "rewrite-list";
+  for (let s=0; s<=step.match_count; s++) {
+    const ul = rewriteList.appendChild(document.createElement("ul"));
+    ul.id = `rewrite-${s}`;
+    const p = ul.appendChild(document.createElement("p"));
+    p.innerText = s;
+    ul.onclick = () => setState({ currentRewrite:s });
+    ul.className = s > ret.length-1 ? "disabled" : s === currentRewrite ? "active" : "";
+    if (s > 0 && s === currentRewrite) {
+      const { upat, diff } = ret[s];
+      metadata.appendChild(codeBlock(upat[1], "python", { loc:upat[0], wrap:true }));
+      const diffCode = metadata.appendChild(document.createElement("pre")).appendChild(document.createElement("code"));
+      for (const line of diff) {
+        diffCode.appendChild(colored([{st:line, color:line.startsWith("+") ? "#3aa56d" : line.startsWith("-") ? "#d14b4b" : "#f0f0f5"}]));
+        diffCode.appendChild(document.createElement("br"));
       }
+      diffCode.className = "wrap";
     }
-  } else codeElement.classList.add("full-height");
+  }
 }
 
 // **** collapse/expand

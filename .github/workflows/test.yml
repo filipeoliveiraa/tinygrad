@@ -102,15 +102,11 @@ jobs:
       run: |
         sudo apt update || true
         sudo apt install -y --no-install-recommends ninja-build
-    - name: Lint with ruff
-      run: |
-        pip3 install --upgrade --force-reinstall ruff==0.11.0
-        python3 -m ruff check extra/torch_backend/backend.py
     - name: Test one op
       run: FORWARD_ONLY=1 TINY_BACKEND=1 python3 test/test_ops.py TestOps.test_add
     - name: Test ResNet-18
       run: DEBUG=2 python3 extra/torch_backend/example.py
-    - name: My (custom) tests
+    - name: custom tests
       run: python3 extra/torch_backend/test.py
     - name: Test one op in torch tests
       run: DEBUG=2 python3 extra/torch_backend/torch_tests.py TestTinyBackendPRIVATEUSE1.test_unary_log_tiny_float32
@@ -233,10 +229,11 @@ jobs:
       run: python -m pylint --disable=all -e W0311 -e C0303 --jobs=0 --indent-string='  ' --recursive=y .
     - name: Lint with ruff
       run: |
-        pip3 install --upgrade --force-reinstall ruff==0.11.0
+        pip3 install --upgrade --force-reinstall ruff==0.14.10
         python3 -m ruff check .
         python3 -m ruff check examples/mlperf/ --ignore E501
         python3 -m ruff check extra/thunder/tiny/ --ignore E501 --ignore F841 --ignore E722
+        python3 -m ruff check extra/torch_backend/backend.py
     - name: Run mypy
       run: |
         python -m mypy --strict-equality --lineprecision-report .
@@ -310,7 +307,7 @@ jobs:
         deps: testing_unit
         python-version: '3.14'
     - name: Test SPEC=2
-      run: IGNORE_OOB=0 SPEC=2 PYTHONPATH="." pytest --maxfail=10 -n auto --durations=30 --ignore=test/models --ignore test/test_custom_kernel.py --ignore test/unit/test_hashing.py --timeout 60 -k "not test_setitem_big" --splits 2 --group ${{ matrix.group }}
+      run: IGNORE_OOB=0 SPEC=2 pytest --maxfail=10 -n auto --durations=30 --ignore=test/models --ignore test/test_custom_kernel.py --ignore test/unit/test_hashing.py --timeout 60 -k "not test_setitem_big" --splits 2 --group ${{ matrix.group }}
 
   fuzzing:
     name: Fuzzing
@@ -587,6 +584,8 @@ jobs:
     name: Linux (WebGPU)
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    env:
+      IGNORE_OOB: 0
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -680,9 +679,9 @@ jobs:
       - name: Run RDNA3 emulator tests (AMD_LLVM=1)
         run: AMD_LLVM=1 python -m pytest -n=auto extra/assembly/amd/ --durations 20
       - name: Run RDNA3 dtype tests
-        run: PYTHONPATH="." AMD=1 PYTHON_REMU=1 MOCKGPU=1 AMD_LLVM=0 pytest -n=auto test/test_dtype_alu.py test/test_dtype.py
+        run: AMD=1 PYTHON_REMU=1 MOCKGPU=1 AMD_LLVM=0 pytest -n=auto test/test_dtype_alu.py test/test_dtype.py
       - name: Run RDNA3 dtype tests (AMD_LLVM=1)
-        run: PYTHONPATH="." AMD=1 PYTHON_REMU=1 MOCKGPU=1 AMD_LLVM=1 pytest -n=auto test/test_dtype_alu.py test/test_dtype.py
+        run: AMD=1 PYTHON_REMU=1 MOCKGPU=1 AMD_LLVM=1 pytest -n=auto test/test_dtype_alu.py test/test_dtype.py
 
   testamdautogen:
     name: AMD autogen
@@ -698,8 +697,7 @@ jobs:
           pydeps: "pdfplumber"
       - name: Verify AMD autogen is up to date
         run: |
-          python -m extra.assembly.amd.dsl --arch all
-          python -m extra.assembly.amd.pcode --arch all
+          python -m extra.assembly.amd.pdf --arch all
           git diff --exit-code extra/assembly/amd/autogen/
 
   testnvidia:
@@ -833,6 +831,8 @@ jobs:
     name: MacOS (WebGPU)
     runs-on: macos-14
     timeout-minutes: 10
+    env:
+      IGNORE_OOB: 0
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -910,6 +910,8 @@ jobs:
     name: Windows (${{ matrix.backend }})
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      IGNORE_OOB: 0
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

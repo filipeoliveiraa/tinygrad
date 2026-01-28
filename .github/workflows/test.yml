@@ -5,7 +5,7 @@ env:
   CAPTURE_PROCESS_REPLAY: 1
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   PYTHONPATH: ${{ github.workspace }}
-  IGNORE_OOB: 0
+  CHECK_OOB: 1
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     env:
-      IGNORE_OOB: 1
+      CHECK_OOB: 0
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -241,7 +241,7 @@ jobs:
         python -m mypy --lineprecision-report .
         cat lineprecision.txt
     - name: Run TYPED=1
-      run: TYPED=1 python -c "import tinygrad"
+      run: CHECK_OOB=0 DEV=CPU TYPED=1 python test/test_tiny.py
 
   unittest:
     name: Unit Tests
@@ -258,6 +258,7 @@ jobs:
         pydeps: "pillow numpy ftfy regex pre-commit"
         deps: testing_unit
         llvm: 'true'
+        amd: 'true'
     - name: Run pre-commit test hooks
       run: SKIP=ruff,mypy pre-commit run --all-files
     - name: Check Device.DEFAULT
@@ -476,7 +477,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      IGNORE_OOB: 1
+      CHECK_OOB: 0
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -679,7 +680,7 @@ jobs:
           python-version: '3.13'
       - name: Verify AMD autogen is up to date
         run: |
-          python -m extra.assembly.amd.amdxml
+          python -m extra.assembly.amd.generate
           git diff --exit-code extra/assembly/amd/autogen/
       - name: Install LLVM 21
         run: |
@@ -769,6 +770,9 @@ jobs:
         run: python -m pytest -n=auto test/ --ignore=test/models --ignore=test/unit --durations=20
       - name: Run TRANSCENDENTAL math
         run: TRANSCENDENTAL=2 python -m pytest -n=auto test/test_ops.py::TestOps::test_sin test/test_ops.py::TestOps::test_cos test/test_ops.py::TestOps::test_tan test/test_ops.py::TestOps::test_exp test/test_ops.py::TestOps::test_log --durations=20
+      - name: Test dtype with emulated long
+        if: matrix.backend != 'lvp' && matrix.backend != 'llvm'
+        run: EMULATED_DTYPES=long python3 -m pytest -n=auto test/test_dtype.py test/test_dtype_alu.py
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
 
@@ -792,8 +796,6 @@ jobs:
         ocelot: 'true'
         llvm: 'true'
     - name: Run unit tests
-      env:
-        LIBCLANG_PATH: '/opt/homebrew/opt/llvm@20/lib/libclang.dylib'
       run: METAL=1 python -m pytest -n=auto test/unit/ --durations=20
     - name: Run ONNX
       run: METAL=1 python -m pytest -n=auto test/external/external_test_onnx_backend.py --durations=20

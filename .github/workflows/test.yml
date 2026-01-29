@@ -239,6 +239,7 @@ jobs:
     - name: Run mypy with lineprecision report
       run: |
         python -m mypy --lineprecision-report .
+        grep -v autogen lineprecision.txt | awk 'NR>2 {lines+=$2; precise+=$3; imprecise+=$4; any+=$5; empty+=$6} END {t=lines-empty; printf "TOTAL: %d lines, %d precise (%.1f%%), %d imprecise (%.1f%%), %d any (%.1f%%)\n", t, precise, 100*precise/t, imprecise, 100*imprecise/t, any, 100*any/t}'
         cat lineprecision.txt
     - name: Run TYPED=1
       run: CHECK_OOB=0 DEV=CPU TYPED=1 python test/test_tiny.py
@@ -255,7 +256,7 @@ jobs:
       uses: ./.github/actions/setup-tinygrad
       with:
         key: unittest-13
-        pydeps: "pillow numpy ftfy regex pre-commit"
+        pydeps: "pillow ftfy regex pre-commit"
         deps: testing_unit
         llvm: 'true'
         amd: 'true'
@@ -566,7 +567,7 @@ jobs:
       with:
         key: dsp-minimal
         deps: testing_minimal
-        pydeps: "onnx==1.18.0 onnxruntime pillow"
+        pydeps: "onnx==1.18.0 onnxruntime"
         llvm: "true"
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -889,7 +890,6 @@ jobs:
         with:
           key: macos-${{ matrix.backend }}-minimal
           deps: testing_minimal
-          pydeps: "capstone"
           llvm: ${{ matrix.backend == 'llvm' || matrix.backend == 'lvp' }}
           mesa: ${{ matrix.backend == 'lvp' && 'true' }}
       - name: Set env

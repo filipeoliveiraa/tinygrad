@@ -153,7 +153,7 @@ class Tensor(OpMixin):
       if data.shape == ():
         data = Tensor(data.item(), device=_device, dtype=_dtype or _from_np_dtype(data.dtype), requires_grad=requires_grad).uop
       else:
-        data = _fromnp(data.astype(npdtype) if _dtype is not None and (npdtype:=_to_np_dtype(_dtype)) is not None else data)  # type: ignore [name-defined]
+        data = _fromnp(data.astype(npdtype) if _dtype is not None and (npdtype:=_to_np_dtype(_dtype)) is not None else data)
     elif isinstance(data, pathlib.Path):
       _dtype = _dtype or dtypes.uint8
       data = UOp.new_buffer(f"DISK:{data.resolve()}", data.stat().st_size // _dtype.itemsize, _dtype)
@@ -1765,8 +1765,8 @@ class Tensor(OpMixin):
     """
     output_dtype = self.dtype if dtypes.is_float(self.dtype) else dtypes.float32
     numerator = self.cast(sum_acc_dtype(self.dtype)).sum(axis=axis, keepdim=keepdim)
-    return numerator.div(prod([cast(int, si) for si, so in zip(self.shape, self.sum(axis=axis, keepdim=True).shape) if resolve(si != so)])) \
-      .cast(output_dtype)
+    denominator = prod([si for si, so in zip(self.shape, self.sum(axis=axis, keepdim=True).shape) if resolve(si != so)])
+    return numerator.div(Tensor.from_uop(denominator, device=numerator.device) if isinstance(denominator, UOp) else denominator).cast(output_dtype)
 
   def var(self, axis:int|Sequence[int]|None=None, keepdim=False, correction=1) -> Tensor:
     """
@@ -1792,7 +1792,8 @@ class Tensor(OpMixin):
     """
     squares = (self - self.mean(axis=axis, keepdim=True)).square()
     n = prod([si for si, so in zip(self.shape, squares.sum(axis=axis, keepdim=True).shape) if resolve(si != so)])
-    return squares.sum(axis=axis, keepdim=keepdim).div(smax([0, n-correction]))
+    denominator = (Tensor.from_uop(n, device=self.device) if isinstance(n, UOp) else Tensor(n, device=self.device)) - correction
+    return squares.sum(axis=axis, keepdim=keepdim).div(denominator.relu())
 
   def var_mean(self, axis:int|Sequence[int]|None=None, keepdim=False, correction=1) -> tuple[Tensor, Tensor]:
     """
@@ -2246,7 +2247,7 @@ class Tensor(OpMixin):
     if ceil_mode: pads = self._apply_ceil_mode(pads, k_, stride if stride is not None else k_, dilation)
     pooled = self.pad(pads, value=dtypes.min(self.dtype))._pool(k_, stride if stride is not None else k_, dilation)
     if not return_indices: return pooled.max(axis)
-    spatial_sz = math.prod(spatial_shape := self.shape[-len(k_):])
+    spatial_sz = int(math.prod(spatial_shape := self.shape[-len(k_):]))
     idx = Tensor.arange(spatial_sz,0,-1, requires_grad=False, device=self.device).reshape(spatial_shape)
     m = pooled == pooled.max(axis, keepdim=True)
     idx = m * idx.pad(pads, value=dtypes.min(idx.dtype))._pool(k_, stride if stride is not None else k_, dilation)
@@ -2503,7 +2504,7 @@ class Tensor(OpMixin):
     ```
     """
     if self.ndim == 0: return self._split_cumalu(axis, Ops.MAX), Tensor.zeros(self.shape, dtype=dtypes.int32, device=self.device)
-    values, n = self._split_cumalu(axis, Ops.MAX), self.shape[axis]
+    values, n = self._split_cumalu(axis, Ops.MAX), int(self.shape[axis])
     x, values_t = self.transpose(axis, -1), values.transpose(axis, -1)
     match = (x.unsqueeze(-1) == values_t.unsqueeze(-2)) * Tensor.ones(n, n, requires_grad=False, device=self.device).triu()
     idx = (-(match * Tensor.arange(n, 0, -1, requires_grad=False, device=self.device).reshape(n, 1)).max(-2) + n).cast(dtypes.int32)
@@ -2594,7 +2595,7 @@ class Tensor(OpMixin):
     assert not (align_corners and mode != "linear"), "align_corners option can only be set with the interpolating mode linear"
     x, expand = self, list(self.shape)
     for i in range(-1,-len(size)-1,-1):
-      scale = (self.shape[i] - int(align_corners)) / (size[i] - int(align_corners))
+      scale = (int(self.shape[i]) - int(align_corners)) / (size[i] - int(align_corners))
       arr, reshape = Tensor.arange(size[i], dtype=dtypes.float32, device=self.device), [1] * self.ndim
       reshape[i] = expand[i] = size[i]
       if mode == "linear":
@@ -2715,7 +2716,7 @@ class Tensor(OpMixin):
     ```
     """
     x, dim = self, self._resolve_dim(dim)
-    if (orig_len:= x.shape[dim]) <= 1: return x, x.zeros_like(dtype=dtypes.default_int)
+    if (orig_len := int(x.shape[dim])) <= 1: return x, x.zeros_like(dtype=dtypes.default_int)
     # pad to power of 2
     n_stages = (orig_len-1).bit_length()
     pads = tuple((0, 2**n_stages - orig_len) if i == dim else None for i in range(x.ndim))
@@ -3542,7 +3543,7 @@ class Tensor(OpMixin):
     ```
     """
     if not dtypes.is_int(self.dtype): raise RuntimeError(f"expect integer dtype, getting {self.dtype=}")
-    if num_classes == -1: num_classes = (self.max()+1).item()
+    if num_classes == -1: num_classes = int((self.max()+1).item())
     return self[..., None]._one_hot_along_dim(num_classes).where(1, 0)
 
   def scaled_dot_product_attention(self, key:Tensor, value:Tensor, attn_mask:Tensor|None=None, dropout_p:float=0.0,
@@ -3569,8 +3570,8 @@ class Tensor(OpMixin):
 
     # GQA: https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
     if enable_gqa:
-      key = key.repeat_interleave(self.shape[-3] // key.shape[-3], dim=-3)
-      value = value.repeat_interleave(self.shape[-3] // value.shape[-3], dim=-3)
+      key = key.repeat_interleave(int(self.shape[-3] // key.shape[-3]), dim=-3)
+      value = value.repeat_interleave(int(self.shape[-3] // value.shape[-3]), dim=-3)
 
     q = self
     qk = q.matmul(key.transpose(-2,-1), dtype=least_upper_dtype(q.dtype, key.dtype, dtypes.float32)) / math.sqrt(q.shape[-1])
@@ -3705,7 +3706,8 @@ class Tensor(OpMixin):
     assert self.ndim > 1, "NS only works for two or more dims"
     if self.shape[-2] > self.shape[-1]: return self.transpose(-2, -1).newton_schulz(steps, params, eps).transpose(-2, -1)
     G = self / (self.square().sum(axis=(-2, -1), keepdim=True).sqrt() + eps)
-    for _ in range(steps): G = sum(p * functools.reduce(lambda x, y: (y @ y.transpose(-2, -1)) @ x, [G]*i, G) for i,p in enumerate(params))
+    for _ in range(steps):
+      G = cast(Tensor, sum(p * functools.reduce(lambda x, y: (y @ y.transpose(-2, -1)) @ x, [G]*i, G) for i,p in enumerate(params)))
     return G
 
   def qr(self) -> tuple[Tensor, Tensor]:
@@ -3800,7 +3802,7 @@ class Tensor(OpMixin):
     print(t.nbytes())
     ```
     """
-    return self.numel() * self.element_size()
+    return int(self.numel()) * self.element_size()
 
   def is_floating_point(self) -> bool:
     """

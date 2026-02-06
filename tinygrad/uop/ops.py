@@ -67,7 +67,8 @@ def consumer_map_from_toposort(lst:Iterable[UOp]):
   ret: dict[UOp, dict[UOp, None]] = {}
   for u in lst:
     ret[u] = {}
-    for s in u.src: ret[s][u] = None
+    for s in u.src:
+      if s in ret: ret[s][u] = None
   return ret
 
 def pretty_print(x:UOp, cache=None, d=0)->str:
@@ -310,6 +311,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def ended_ranges(self):
     if self.op in range_start: return self.src[range_start[self.op]:]
     if self.op is Ops.AFTER: return tuple(flatten([x.ended_ranges for x in self.src[1:]]))
+    # TODO: copy isn't using range properly and isn't ending the range it uses, remove this
+    if self.op in {Ops.COPY, Ops.BUFFER_VIEW}: return self.src[0].ranges
     return ()
 
   # determine what ranges this is in
@@ -539,6 +542,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def base(self) -> UOp:
     if self.op in GroupOp.Movement: return self.src[0].base
     if self.op is Ops.MULTI: return self.src[0].base  # MULTI is really a VIEW
+    if self.op is Ops.DETACH: return self.src[0].base  # DETACH can't change base
     return self
 
   # like gep, but might return an integer
@@ -818,7 +822,9 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     src = (UOp(Ops.NOOP) if shape is None else shape_to_shape_arg(shape),) + (() if device is None else (UOp(Ops.DEVICE, arg=device),))
     return UOp(Ops.PARAM, dtype, src, arg=slot)
 
-  def call(*srcs:UOp, fxn:UOp, arg:Any|None) -> UOp: return UOp(Ops.CALL, fxn.dtype, (fxn,)+srcs, arg)
+  def call(self, *srcs:UOp, grad_fxn:Callable|None=None, metadata:tuple[Metadata, ...]=()) -> UOp:
+    assert len(self.ranges) == 0, f"ranges {self.ranges} are leaking out of the call"
+    return UOp(Ops.CALL, self.dtype, (self,)+srcs, CallInfo(grad_fxn, metadata))
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
     contig_srcs = tuple(x.contiguous() if x.op is not Ops.AFTER else x for x in srcs)
     kernel = UOp(Ops.CUSTOM_KERNEL, src=contig_srcs, arg=CustomKernel(fxn=fxn, grad_fxn=grad_fxn))
@@ -842,6 +848,14 @@ class CustomKernel:
   # sadly CustomKernel can't be pickled or reconstructed as a str
   def __reduce__(self): return (CustomKernel, (panic,))
   def __repr__(self): return f"CustomKernel({id(self.fxn)})"
+
+@dataclass(frozen=True)
+class CallInfo:
+  grad_fxn: Callable|None = None
+  metadata: tuple[Metadata, ...] = ()
+  # grad_fxn can't be pickled, but metadata can
+  def __reduce__(self): return (CallInfo, (None, self.metadata))
+  def __repr__(self): return f"CallInfo({id(self.grad_fxn) if self.grad_fxn else None}, {self.metadata})"
 
 @dataclass(frozen=True)
 class Kernel:

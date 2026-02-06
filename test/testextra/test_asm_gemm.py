@@ -3,6 +3,7 @@ from tinygrad import Tensor, Device, dtypes, Context
 from tinygrad.device import is_dtype_supported
 from tinygrad.helpers import getenv, CI
 from extra.gemm.asm.cdna.gemm import asm_gemm
+from test.helpers import needs_second_gpu
 
 def verify_asm_gemm(batch:int, M:int, N:int, K:int, dtype=dtypes.float16, gpus:int=1) -> None:
   Tensor.manual_seed(0)
@@ -37,6 +38,7 @@ class TestGemm(unittest.TestCase):
   def test_simple(self): verify_asm_gemm(1, N:=(getenv("N", 4096)//SCALE), N, N, dtype=dtypes.half)
   def test_gemm(self): verify_asm_gemm(1, 8192//SCALE, 4096//SCALE, 14336//SCALE)
   def test_gemm_batched(self): verify_asm_gemm(2, 8192//SCALE, 4096//SCALE, 4096//SCALE)
+  @needs_second_gpu
   def test_gemm_multi(self): verify_asm_gemm(2, 8192//SCALE, 4096//SCALE, 4096//SCALE, gpus=2)
 
 class TestGemmLarge(unittest.TestCase):
@@ -45,11 +47,13 @@ class TestGemmLarge(unittest.TestCase):
       self.skipTest("very slow on non mi350x")
 
   def test_gemm1(self): verify_asm_gemm(8, 8192, 4096, 14336, dtype=dtypes.bfloat16, gpus=8)
+  @unittest.skip("disabled, asm in this shape is slower than tinygrad")
   def test_gemm2(self): verify_asm_gemm(8, 8192, 128256, 4096, dtype=dtypes.bfloat16, gpus=8)
   def test_gemm3(self): verify_asm_gemm(8, 8192, 14336, 4096, dtype=dtypes.bfloat16, gpus=8)
   def test_gemm4(self): verify_asm_gemm(8, 4096, 14336, 4096, dtype=dtypes.bfloat16, gpus=8)
   def test_gemm5(self): verify_asm_gemm(8, 4096, 4096, 14336, dtype=dtypes.bfloat16, gpus=8)
   def test_gemm6(self): verify_asm_gemm(16, 4096, 4096, 14336, dtype=dtypes.bfloat16, gpus=8)
+  @unittest.skip("disabled, asm in this shape is slower than tinygrad")
   def test_gemm7(self): verify_asm_gemm(1, 8192, 128256, 4096)
   def test_gemm_unsupported(self):
     with self.assertRaisesRegex(AssertionError, "shape not supported"):

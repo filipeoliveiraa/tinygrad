@@ -1279,20 +1279,19 @@ class Tensor(OpMixin):
     return self._getitem(indices)
 
   def __setitem__(self, indices, v:Tensor|PyConst|list|tuple) -> None:
+    if isinstance(v, Tensor) and v.dtype != self.dtype: raise RuntimeError(f"setitem dtype mismatch: {self.dtype=} != {v.dtype=}")
     if isinstance(self.device, str) and self.device.startswith("DISK"):
       self.realize()._getitem(indices).assign(v)
       return
-    # NOTE: check that setitem target is valid first
     if not isinstance(v, Tensor): v = Tensor(v, device=self.device, dtype=self.dtype)
     if self.requires_grad or v.requires_grad: raise NotImplementedError("setitem with requires_grad is not supported")
-    self.realize()
-    if not self.uop.is_writable_view(): raise RuntimeError("setitem target must be a writable view backed by a buffer")
     res = self._getitem(indices, v)
-    # if shapes match and data is not shared it's a copy and we assign to self
+    # if shapes match and data is not shared, it's advanced indexing, res is the assigned output
     if res.shape == self.shape and res.uop is not self.uop:
       self.assign(res).realize()
-    else: # no copy, basic setitem
-      v = v.cast(res.dtype)._broadcast_to(_broadcast_shape(res.shape, v.shape)).contiguous()
+    else: # basic setitem
+      self.realize()
+      if not self.uop.is_writable_view(): raise RuntimeError("setitem target must be a writable view backed by a buffer")
       res.assign(v).realize()
 
   def __delitem__(self, indices) -> None:

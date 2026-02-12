@@ -274,11 +274,20 @@ class Tensor(OpMixin):
     """Triggers the computation needed to create these Tensor(s)."""
     # side-realize pending assigns for buffers referenced by these tensors
     if _pending_assigns:
-      for buf in {u for t in (self,)+lst for u in t.uop.toposort() if u.op is Ops.BUFFER}:
+      def _realize_pending(buf):
         for assign_uop in _pending_assigns.pop(buf, []):
+          # recursively realize pending assigns that this assign's value depends on
+          for u in assign_uop.toposort():
+            if u.op is Ops.BUFFER and u in _pending_assigns: _realize_pending(u)
           becomes_map, schedule, var_vals = complete_create_schedule_with_vars(UOp.sink(assign_uop))
           _apply_map_to_tensors(becomes_map, name="Apply Pending Assign")
           run_schedule(schedule, var_vals, do_update_stats=do_update_stats)
+          # update remaining pending assigns so they reference realized buffers instead of stale lazy graphs
+          if becomes_map:
+            for assigns in _pending_assigns.values():
+              for i in range(len(assigns)): assigns[i] = assigns[i].substitute(becomes_map)
+      for buf in {u for t in (self,)+lst for u in t.uop.toposort() if u.op is Ops.BUFFER}:
+        if buf in _pending_assigns: _realize_pending(buf)
     if len(to_realize:=[x for x in (self,)+lst if not x.uop.has_buffer_identity()]):
       run_schedule(*Tensor.schedule_with_vars(*to_realize), do_update_stats=do_update_stats)
     return self
@@ -3991,7 +4000,7 @@ class Tensor(OpMixin):
     return cx.image_conv2d(cw, groups=groups, dtype=dtype).reshape(out_shape_t).transpose(self.ndim-1, self.ndim-2)
 
   def image_conv2d(self, weight:Tensor, bias:Tensor|None=None, groups=1, stride=1, dilation=1, padding=0, dtype=None) -> Tensor:
-    base_image_type, dtsz = (dtypes.imageh, 2) if getenv("FLOAT16", 0) else (dtypes.imagef, 4)
+    base_image_type, dtsz = (dtypes.imageh, 2) if (FLOAT16:=getenv("FLOAT16", 0)) else (dtypes.imagef, 4)
 
     (bs,_,iy,ix), (cout,cin,H,W) = self.shape, weight.shape
     x, w = self, weight.reshape(groups, (rcout := cout//groups), cin, H, W)
@@ -4036,7 +4045,8 @@ class Tensor(OpMixin):
 
     # contiguous creates the image, and early realize static weights (TODO: test for the static weight)
     if IMAGE >= 2: x,w = x.cast(base_image_type((bs*iy, ix*groups*cin//4, 4))), w.cast(base_image_type((cout//4, H*W*cin, 4)))
-    x, w = x.contiguous(), w.contiguous()
+    if IMAGE == 1 and FLOAT16: x, w = x.cast(dtypes.half).contiguous().cast(dtypes.float), w.cast(dtypes.half).contiguous().cast(dtypes.float)
+    else: x, w = x.contiguous(), w.contiguous()
 
     if IMAGE == 1 and added_weight: w, H = w[:, :-added_weight, ...], H - added_weight
 

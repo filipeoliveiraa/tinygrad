@@ -14,8 +14,8 @@ from tinygrad import Tensor, Device, Context, GlobalCounters
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.helpers import getenv, colored
 from tinygrad.engine.realize import Estimates
-from extra.assembly.amd.dsl import s, v, VCC_LO, NULL
-from extra.assembly.amd.autogen.rdna3.ins import *
+from tinygrad.renderer.amd.dsl import s, v, VCC_LO, NULL
+from tinygrad.runtime.autogen.amd.rdna3.ins import *
 
 # =============================================================================
 # Kernel constants
@@ -192,7 +192,8 @@ class Kernel:
       inst.simm16 = offset_dwords
 
     # TODO: replace this with direct ELF
-    body = ['\t' + inst.disasm() for inst in self.instructions]
+    from test.amd.disasm import disasm
+    body = ['\t' + disasm(inst) for inst in self.instructions]
 
     # limit wave occupancy by using more LDS
     lds_size = max(LDS_SIZE, 65536//getenv("LIMIT_OCC", 65536))

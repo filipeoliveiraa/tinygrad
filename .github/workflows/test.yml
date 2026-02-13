@@ -708,6 +708,8 @@ jobs:
         run: SKIP_SLOW_TEST=1 AMD_LLVM=0 pytest -n=auto test/backend/test_ops.py -k "test_sparse_categorical_crossentropy or test_tril or test_nonzero or test_softmax_argmax" --durations 20
       - name: Run RDNA4 emulator tests
         run: MOCKGPU_ARCH=rdna4 python -m pytest test/test_tiny.py -v --durations 20
+      - name: Run CDNA4 emulator tests
+        run: AMD_LLVM=1 MOCKGPU_ARCH=cdna4 python -m pytest test/test_tiny.py -v --durations 20
 
   testnvidia:
     strategy:
@@ -853,14 +855,14 @@ jobs:
         key: osx-webgpu
         deps: testing
         webgpu: 'true'
-    - name: Test infinity math in WGSL
-      run: WEBGPU=1 python -m pytest -n=auto test/backend/test_renderer_failures.py::TestWGSLFailures::test_multiply_infinity --durations=20
     - name: Build WEBGPU Efficientnet
       run: WEBGPU=1 WEBGPU_BACKEND="WGPUBackendType_Metal" python3 -m examples.compile_efficientnet
-    - name: Clean npm cache
-      run: npm cache clean --force
-    - name: Install Puppeteer
-      run: npm install puppeteer
+    - name: Run selected webgpu tests
+      run: WEBGPU=1 WEBGPU_BACKEND="WGPUBackendType_Metal" python3 -m pytest -n=auto test/backend --durations=20
+    #- name: Clean npm cache
+    #  run: npm cache clean --force
+    #- name: Install Puppeteer
+    #  run: npm install puppeteer
     # this is also flaky
     #- name: Run WEBGPU Efficientnet
     #  run: node test/web/test_webgpu.js

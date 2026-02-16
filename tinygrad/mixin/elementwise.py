@@ -1,10 +1,12 @@
 import math
 from typing import Self
 from tinygrad.uop import Ops
-from tinygrad.dtype import dtypes, ConstType
+from tinygrad.dtype import dtypes, ConstType, least_upper_dtype, least_upper_float
+from tinygrad.helpers import polyN
+from tinygrad.mixin.dtype import DTypeMixin
 
 
-class MathMixin:
+class ElementwiseMixin(DTypeMixin):
   # required to implement
   def alu(self, op: Ops, *src: Self) -> Self:
     raise NotImplementedError
@@ -14,7 +16,7 @@ class MathMixin:
 
   # great functions you get!
   def ufix(self, x: Self | ConstType) -> Self:
-    return self.const_like(x) if not isinstance(x, MathMixin) else x
+    return self.const_like(x) if not isinstance(x, ElementwiseMixin) else x
 
   def _binop(self, op: Ops, x: Self | ConstType, reverse: bool) -> Self:
     return self.ufix(x).alu(op, self) if reverse else self.alu(op, self.ufix(x))
@@ -23,16 +25,11 @@ class MathMixin:
     return self.ne(True)
 
   def neg(self) -> Self:
-    if (dtype := getattr(self, "dtype")) is None:
-      raise TypeError(f"MathTraits __neg__ requires a dtype, {self=}")
-    return self.logical_not() if dtype.scalar() == dtypes.bool else self * (-1)
+    return self.logical_not() if self.dtype.scalar() == dtypes.bool else self * (-1)
 
   def _check_dtype(self) -> None:
-    if (dtype := getattr(self, "dtype")) is not None:
-      if isinstance(dtype, tuple):
-        dtype = dtype[0]
-      if not (dtypes.is_bool(dtype) or dtypes.is_int(dtype)):
-        raise RuntimeError(f"{dtype} is not supported")
+    if not (dtypes.is_bool(self.dtype) or dtypes.is_int(self.dtype)):
+      raise RuntimeError(f"{self.dtype} is not supported")
 
   def add(self, x: Self | ConstType, reverse: bool = False) -> Self:
     """
@@ -199,10 +196,10 @@ class MathMixin:
     return self.mod(x, True)
 
   def __lt__(self, x: Self | ConstType) -> Self:
-    return self.alu(Ops.CMPLT, self.ufix(x))
+    return self._binop(Ops.CMPLT, x, False)
 
   def __gt__(self, x: Self | ConstType) -> Self:
-    return self.ufix(x).alu(Ops.CMPLT, self)
+    return self._binop(Ops.CMPLT, x, True)
 
   def __ge__(self, x: Self | ConstType) -> Self:
     return (self < x).logical_not()
@@ -211,7 +208,7 @@ class MathMixin:
     return (self > x).logical_not()
 
   def ne(self, x: Self | ConstType) -> Self:
-    return self.alu(Ops.CMPNE, self.ufix(x))
+    return self._binop(Ops.CMPNE, x, False)
 
   def eq(self, x: Self | ConstType) -> Self:
     return self.ne(x).logical_not()
@@ -240,7 +237,17 @@ class MathMixin:
     return self.rshift(x, True)
 
   def maximum(self, x: Self | ConstType) -> Self:
-    return self.alu(Ops.MAX, self.ufix(x))
+    """
+    Computes element-wise maximum of `self` and `x`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-1, 2, 3]).maximum(1).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-1, 2, 3]).maximum(Tensor([-4, -2, 9])).numpy())
+    ```
+    """
+    return self._binop(Ops.MAX, x, False)
 
   def minimum(self, x: Self | ConstType) -> Self:
     return -(-self).maximum(-self.ufix(x))
@@ -255,8 +262,18 @@ class MathMixin:
   def threefry(self, seed: Self) -> Self:
     return self.alu(Ops.THREEFRY, seed)
 
+  def _ensure_float(self) -> Self:
+    return self if self.is_floating_point() else self.cast(least_upper_float(self.dtype))
+
   def reciprocal(self) -> Self:
-    return self.alu(Ops.RECIPROCAL)
+    """
+    Computes `1/x` element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([1., 2., 3., 4.]).reciprocal().numpy())
+    ```
+    """
+    return self._ensure_float().alu(Ops.RECIPROCAL)
 
   def trunc(self) -> Self:
     """
@@ -269,16 +286,73 @@ class MathMixin:
     return self.alu(Ops.TRUNC)
 
   def sqrt(self) -> Self:
-    return self.alu(Ops.SQRT)
+    """
+    Computes the square root of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([1., 2., 3., 4.]).sqrt().numpy())
+    ```
+    """
+    return self._ensure_float().alu(Ops.SQRT)
 
   def sin(self) -> Self:
-    return self.alu(Ops.SIN)
+    """
+    Computes the sine of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([0., math.pi/2, math.pi, 3*math.pi/2, 2*math.pi]).sin().numpy())
+    ```
+    """
+    return self._ensure_float().alu(Ops.SIN)
+
+  def cos(self) -> Self:
+    """
+    Computes the cosine of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([0., math.pi/2, math.pi, 3*math.pi/2, 2*math.pi]).cos().numpy())
+    ```
+    """
+    if self.is_floating_point(): return ((math.pi/2)-self.cast(least_upper_dtype(self.dtype, dtypes.float32))).sin().cast(self.dtype)
+    return ((math.pi/2)-self).sin()
+
+  def exp(self) -> Self:
+    """
+    Computes the exponential function element-wise.
+
+    See: https://en.wikipedia.org/wiki/Exponential_function
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([0., 1., 2., 3.]).exp().numpy())
+    ```
+    """
+    if self.is_floating_point():
+      return self.cast(least_upper_dtype(self.dtype, dtypes.float32)).mul(1/math.log(2)).exp2().cast(self.dtype)
+    return self.mul(1/math.log(2)).exp2()
 
   def log2(self) -> Self:
-    return self.alu(Ops.LOG2)
+    """
+    Computes the base-2 logarithm element-wise.
+
+    See: https://en.wikipedia.org/wiki/Logarithm
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([1., 2., 4., 8.]).log2().numpy())
+    ```
+    """
+    return self._ensure_float().alu(Ops.LOG2)
 
   def exp2(self) -> Self:
-    return self.alu(Ops.EXP2)
+    """
+    Computes the base-2 exponential function element-wise.
+
+    See: https://en.wikipedia.org/wiki/Exponential_function
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([0., 1., 2., 3.]).exp2().numpy())
+    ```
+    """
+    return self._ensure_float().alu(Ops.EXP2)
 
   def pow(self, x: Self | ConstType) -> Self:
     return self.alu(Ops.POW, self.ufix(x))
@@ -514,3 +588,222 @@ class MathMixin:
     ```
     """
     return self.sqrt().reciprocal()
+
+  def log(self) -> Self:
+    """
+    Computes the natural logarithm element-wise.
+
+    See: https://en.wikipedia.org/wiki/Logarithm
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([1., 2., 4., 8.]).log().numpy())
+    ```
+    """
+    return self.log2()*math.log(2)
+
+  def log10(self) -> Self:
+    """
+    Computes the base-10 logarithm element-wise.
+
+    See: https://en.wikipedia.org/wiki/Logarithm
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([1., 2., 4., 8.]).log10().numpy())
+    ```
+    """
+    return self.log2()*math.log10(2)
+
+  def atanh(self) -> Self:
+    """
+    Applies the Inverse Hyperbolic Tangent (atanh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Inverse_hyperbolic_functions#atanh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-0.9, -0.6, -0.3, 0., 0.3, 0.6, 0.9]).atanh().numpy())
+    ```
+    """
+    return ((1 + self)/(1 - self)).log() / 2
+
+  def asinh(self) -> Self:
+    """
+    Applies the Inverse Hyperbolic Sine (asinh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Inverse_hyperbolic_functions#asinh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).asinh().numpy())
+    ```
+    """
+    return (self + (self.square() + 1).sqrt()).log()
+
+  def acosh(self) -> Self:
+    """
+    Applies the Inverse Hyperbolic Cosine (acosh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Inverse_hyperbolic_functions#acosh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).acosh().numpy())
+    ```
+    """
+    return (self + (self.square() - 1).sqrt()).log()
+
+  def round(self) -> Self:
+    """
+    Rounds the tensor element-wise with rounding half to even.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]).round().numpy())
+    ```
+    """
+    return ((self > 0).eq((b := self.trunc() / 2.0).trunc().eq(b))).where((self - 0.5).ceil(), (self + 0.5).floor())
+
+  def sign(self) -> Self:
+    """
+    Returns the sign of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).sign().numpy())
+    ```
+    """
+    return self.ne(0).where((self < 0).where(self.const_like(-1), self.const_like(1)), self.const_like(0)) + self * 0
+
+  def abs(self) -> Self:
+    """
+    Computes the absolute value of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).abs().numpy())
+    ```
+    """
+    return self * self.sign()
+
+  def tan(self) -> Self:
+    """
+    Computes the tangent of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([0., math.pi/4, math.pi/2, 3*math.pi/4, math.pi]).tan().numpy())
+    ```
+    """
+    return self.sin() / self.cos()
+
+  def asin(self) -> Self:
+    """
+    Computes the inverse sine (arcsine) of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-0.9, -0.6, -0.3, 0., 0.3, 0.6, 0.9]).asin().numpy())
+    ```
+    """
+    # https://personal.math.ubc.ca/~cbm/aands/page_81.htm 4.4.46
+    coefficients = [-0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810, -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050]
+    x = math.pi / 2 - (1.0 - self.abs()).sqrt() * polyN(self.abs(), coefficients)
+    return self.sign() * x
+
+  def acos(self) -> Self:
+    """
+    Computes the inverse cosine (arccosine) of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-0.9, -0.6, -0.3, 0., 0.3, 0.6, 0.9]).acos().numpy())
+    ```
+    """
+    return math.pi / 2 - self.asin()
+
+  def atan(self) -> Self:
+    """
+    Computes the inverse tangent (arctan) of the tensor element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).atan().numpy())
+    ```
+    """
+    return (self / (1 + self * self).sqrt()).asin()
+
+  def elu(self, alpha=1.0) -> Self:
+    """
+    Applies the Exponential Linear Unit (ELU) function element-wise.
+
+    - Paper: https://arxiv.org/abs/1511.07289v5
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).elu().numpy())
+    ```
+    """
+    return self.relu() - alpha*(1-self.exp()).relu()
+
+  def celu(self, alpha=1.0) -> Self:
+    """
+    Applies the Continuously differentiable Exponential Linear Unit (CELU) function element-wise.
+
+    - Paper: https://arxiv.org/abs/1704.07483
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).celu().numpy())
+    ```
+    """
+    return self.maximum(0) + (alpha * ((self / alpha).exp() - 1)).minimum(0)
+
+  def sinh(self) -> Self:
+    """
+    Applies the Hyperbolic Sine (sinh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Hyperbolic_functions#Sinh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).sinh().numpy())
+    ```
+    """
+    return (self.exp() - self.neg().exp()) / 2
+
+  def cosh(self) -> Self:
+    """
+    Applies the Hyperbolic Cosine (cosh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Hyperbolic_functions#Cosh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).cosh().numpy())
+    ```
+    """
+    return (self.exp() + self.neg().exp()) / 2
+
+  def erf(self) -> Self:
+    """
+    Applies error function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Error_function
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-1.5, -1.0, -0.5, 0., 0.5, 1.0, 1.5]).erf().numpy())
+    ```
+    """
+    # https://personal.math.ubc.ca/~cbm/aands/page_299.htm 7.1.26
+    t = 1.0 / (1.0 + 0.3275911 * self.abs())
+    return self.sign() * (1.0 - t * polyN(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592]) * (-self.square()).exp())
+
+  def softsign(self) -> Self:
+    """
+    Applies the Softsign function element-wise.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).softsign().numpy())
+    ```
+    """
+    return self / (1 + self.abs())
+
+  def bitwise_not(self) -> Self:
+    """
+    Computes the bitwise NOT of `self`.
+    Equivalent to `~self`.
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([0, 2, 5, 255], dtype="int8").bitwise_not().numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor([True, False]).bitwise_not().numpy())
+    ```
+    """
+    if self.dtype != dtypes.bool and not dtypes.is_int(self.dtype): raise RuntimeError(f"{self.dtype} is not supported")
+    return self.logical_not() if self.dtype == dtypes.bool else self ^ -1

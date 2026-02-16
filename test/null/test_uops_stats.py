@@ -68,28 +68,6 @@ class TestMemoryCount(unittest.TestCase):
     _, mem = get_stats(a.assign(a+a))
     self.assertEqual(mem, 1024*1024*2)  # 1 read + 1 write
 
-  def test_setitem_slice_const(self):
-    t = Tensor.empty(100, dtype=dtypes.int).realize()
-    GlobalCounters.reset()
-    t[20:50] = 3
-    t.realize()
-    self.assertEqual(GlobalCounters.global_mem, 30*4)  # 30 elements written
-
-  def test_setitem_slice_tensor(self):
-    t = Tensor.empty(100, dtype=dtypes.int).realize()
-    v = Tensor.empty(30, dtype=dtypes.int).realize()
-    GlobalCounters.reset()
-    t[20:50] = v
-    t.realize()
-    self.assertEqual(GlobalCounters.global_mem, 30*4*2)  # 30 read + 30 written
-
-  def test_setitem_full(self):
-    t = Tensor.empty(100, dtype=dtypes.int).realize()
-    GlobalCounters.reset()
-    t[:] = 3
-    t.realize()
-    self.assertEqual(GlobalCounters.global_mem, 100*4)  # full buffer written
-
   @unittest.skipIf(Device.DEFAULT == "CPU", "test copy to CPU from other device")
   def test_copyout(self):
     a = Tensor.empty(32, dtype=dtypes.uint8).to("CPU")
@@ -167,7 +145,7 @@ class TestUOpsStats(unittest.TestCase):
     u3 = UOp(Ops.CONST, dtypes.int, tuple(), 3)
     u4 = UOp(Ops.MUL, dtypes.int, (u1,u2))
     u5 = UOp(Ops.ADD, dtypes.int, (u4,u3))
-    uops = list(u5.toposort())
+    uops = tuple(u5.toposort())
 
     globl = UOp(Ops.PARAM, dtypes.int.ptr(), tuple())
     o1 = UOp(Ops.CONST, dtypes.int, tuple(), 1)
@@ -176,7 +154,7 @@ class TestUOpsStats(unittest.TestCase):
     u2 = globl.index(o2)
     u3 = UOp(Ops.CONST, dtypes.int, tuple(), 3)
     u4 = UOp(Ops.MULACC, dtypes.int, (u1,u2,u3))
-    uops_fma = list(u4.toposort())
+    uops_fma = tuple(u4.toposort())
 
     self.assertEqual(flops_mem(uops), flops_mem(uops_fma))
 

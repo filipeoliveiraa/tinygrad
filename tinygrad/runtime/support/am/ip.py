@@ -70,7 +70,7 @@ class AM_GMC(AM_IP):
     self.trans_futher = self.adev.ip_ver[am.GC_HWIP] < (10, 0, 0)
 
     # mi3xx has 48-bit, others have 44-bit address space
-    self.address_space_mask = (1 << (48 if self.adev.ip_ver[am.GC_HWIP][:2] == (9,4) else 44)) - 1
+    self.address_space_mask = (1 << (48 if self.adev.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else 44)) - 1
 
     self.memscratch_xgmi_paddr = self.adev.paddr2xgmi(self.adev.mm.palloc(0x1000, zero=False, boot=True))
     self.dummy_page_xgmi_paddr = self.adev.paddr2xgmi(self.adev.mm.palloc(0x1000, zero=False, boot=True))
@@ -174,7 +174,7 @@ class AM_GMC(AM_IP):
   def check_fault(self) -> str|None:
     va = (self.adev.reg('regGCVM_L2_PROTECTION_FAULT_ADDR_HI32').read()<<32) | self.adev.reg('regGCVM_L2_PROTECTION_FAULT_ADDR_LO32').read()
     if self.adev.reg(self.pf_status_reg("GC")).read():
-      return f"GCVM_L2_PROTECTION_FAULT_STATUS: {self.adev.reg(self.pf_status_reg('GC')).read_bitfields()} {va<<12:#x}"
+      return f"am {self.adev.devfmt}: GCVM_L2_PROTECTION_FAULT_STATUS: {self.adev.reg(self.pf_status_reg('GC')).read_bitfields()} {va<<12:#x}"
     return None
 
 class AM_SMU(AM_IP):

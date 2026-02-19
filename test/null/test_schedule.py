@@ -1,5 +1,5 @@
 # schedule tests that pass on NULL backend (no copyout needed)
-import unittest, time
+import gc, unittest, time
 from tinygrad import nn, dtypes, Device, Tensor
 from tinygrad.device import is_dtype_supported
 from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat
@@ -59,7 +59,7 @@ class TestBufferUOp(unittest.TestCase):
 
   def test_buffer_view_not_allowed(self):
     permuted_view = Tensor.empty(1, 2, 3).permute(0, 2, 1)
-    with self.assertRaisesRegex(AssertionError, "can only be RESHAPE"):
+    with self.assertRaises(RuntimeError):
       permuted_view.uop.buffer # cannot access Buffer of a non contiguous VIEW
 
   def test_buffer_only_after_realize(self):
@@ -74,7 +74,7 @@ class TestBufferUOp(unittest.TestCase):
     self.assertIsNotNone(a.uop.buffer)
 
   def test_const_does_not_realize(self):
-    a = Tensor(1)+Tensor(2)
+    a = Tensor(1)
     run_schedule(check_schedule(a, 0))
     self.assertIsNone(a.uop.base.realized)
 
@@ -642,6 +642,7 @@ class TestSchedule(unittest.TestCase):
     t = Tensor([1.0, 2.0, 3.0]) ** 8
     self.assertEqual(self._alu_from_tensor(t), [Ops.MUL, Ops.MUL, Ops.MUL])
 
+  @unittest.skip("const folding is removed")
   def test_pow_const_tensor_to_zero(self):
     x = Tensor([1,2,3,4])
     out = x ** Tensor(0.0)
@@ -895,9 +896,11 @@ class TestSchedule(unittest.TestCase):
     check_schedule(out, 2)
 
   def test_schedule_mem_used(self):
+    gc.collect()
     base = GlobalCounters.mem_used
     Tensor.ones(256).contiguous().realize()
     Tensor.ones(5, 5).contiguous().schedule()
+    gc.collect()
     self.assertEqual(GlobalCounters.mem_used-base, 0)
 
   def test_const_schedule(self):
@@ -1001,6 +1004,7 @@ class TestUOpBecome(unittest.TestCase):
 
   # sometimes we prefer to perform an op before movement ops, in this case we should stack the mops on top of the new buffer
 
+  @unittest.skip("no longer supported")
   def test_reorder_expand(self):
     a = Tensor.empty(4, 1)
     b = a.expand(4, 4).reciprocal()
@@ -1036,6 +1040,7 @@ class TestUOpBecome(unittest.TestCase):
     late_add = noop+2
     late_add.realize()
 
+  @unittest.skip("const folding is removed")
   def test_become_const_in_base(self):
     a = Tensor.empty(4)
     b = a*0
@@ -1043,6 +1048,7 @@ class TestUOpBecome(unittest.TestCase):
     check_schedule(b, 0)
     assert UPat(Ops.CONST, arg=0).match(b.uop.base, {}) # scheduling replaces the tensor uop with a VIEW(BUFFER)
 
+  @unittest.skip("const folding is removed")
   def test_become_const_from_const(self):
     const_add = Tensor(1)+Tensor(2)
     assert UPat(Ops.ADD).match(const_add.uop, {})

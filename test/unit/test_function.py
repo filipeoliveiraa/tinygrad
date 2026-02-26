@@ -2,6 +2,7 @@ import numpy as np
 import unittest
 from tinygrad.function import function
 from tinygrad import Tensor
+from tinygrad.uop.ops import UOp
 
 class TestFunction(unittest.TestCase):
   def test_simple(self):
@@ -84,9 +85,10 @@ class TestFunction(unittest.TestCase):
 
     a = Tensor([[1.,2.],[3.,4.]], requires_grad=True)
     b = Tensor([[5.,6.],[7.,8.]], requires_grad=True)
-    na, nb = a.numpy(), b.numpy()
     (f(a, b).contiguous() * b).sum().backward()
+    Tensor.realize(a, b, a.grad, b.grad)
     # L = sum((a@b) * b), dL/d(a@b) = b, dL/da = b @ b^T, dL/db = a^T @ b + (a@b)
+    na, nb = a.numpy(), b.numpy()
     np.testing.assert_allclose(a.grad.numpy(), nb @ nb.T)
     np.testing.assert_allclose(b.grad.numpy(), na.T @ nb + na @ nb)
 
@@ -101,7 +103,6 @@ class TestFunction(unittest.TestCase):
     np.testing.assert_allclose(w.grad.numpy(), [4., 5., 6.])
 
   def test_symbolic_index(self):
-    from tinygrad.uop.ops import UOp
     table = Tensor([10,20,30,40]).contiguous().realize()
     @function
     def f(x:Tensor, start_pos:int|UOp) -> Tensor:
@@ -109,6 +110,14 @@ class TestFunction(unittest.TestCase):
 
     v = UOp.variable("start_pos", 0, 3)
     np.testing.assert_equal(f(Tensor([1,2,3]), v.bind(0)).numpy(), [11,12,13])
+
+  def test_symbolic_shape_input(self):
+    table = Tensor([10,20,30,40]).contiguous().realize()
+    @function
+    def f(x:Tensor) -> Tensor: return x * 2
+    sz = UOp.variable("sz", 1, 3)
+    slic = table[:sz.bind(2)]
+    np.testing.assert_equal(f(slic)[:2].numpy(), [20,40])
 
   def test_nested_calls(self):
     w = Tensor([10., 20., 30.])
@@ -139,6 +148,50 @@ class TestFunction(unittest.TestCase):
     f = function(foo)
     np.testing.assert_equal(f(Tensor([1,2,3])).numpy(), [11,22,33])
     assert f(Tensor([1,2,3])).uop.arg.name.endswith("Foo")
+
+  def test_iadd(self):
+    @function
+    def f(x:Tensor) -> Tensor:
+      x += 1
+      return x
+
+    a = Tensor([1,2,3]).realize()
+    np.testing.assert_equal(f(a).numpy(), [2,3,4])
+    np.testing.assert_equal(a.numpy(), [3,4,5])  # TODO: should be [1,2,3]
+
+  def test_implicit_assign(self):
+    a = Tensor([1,2,3])
+    a += 1
+    c = Tensor([2,2,2]).contiguous()
+    @function
+    def f(b:Tensor) -> Tensor: return a+b+c
+    b = Tensor([10,20,30]).realize()
+    np.testing.assert_equal(f(b).numpy(), [14,25,36])
+
+  def test_assign_input(self):
+    @function
+    def f(a:Tensor, b:Tensor) -> Tensor:
+      a.assign(b+1)
+      return a
+
+    a = Tensor([1,2,3]).realize()
+    b = Tensor([10,20,30]).realize()
+    np.testing.assert_equal(f(a,b).numpy(), [11,21,31])
+    np.testing.assert_equal(a.numpy(), [11,21,31])  # TODO: should be [1,2,3]
+    np.testing.assert_equal(b.numpy(), [10,20,30])
+
+  @unittest.expectedFailure
+  def test_assign_slice(self):
+    @function
+    def f(a:Tensor, b:Tensor) -> Tensor:
+      a[1:] = b[1:]+1
+      return a
+
+    a = Tensor([1,2,3]).realize()
+    b = Tensor([10,20,30]).realize()
+    np.testing.assert_equal(f(a,b).numpy(), [1,21,31])
+    np.testing.assert_equal(a.numpy(), [1,2,3])
+    np.testing.assert_equal(b.numpy(), [10,20,30])
 
 if __name__ == '__main__':
   unittest.main()

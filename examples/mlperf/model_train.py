@@ -1344,6 +1344,7 @@ def train_llama3():
   vocab_mask:Tensor = Tensor.arange(model_params['vocab_size']).reshape(1, 1, -1) >= real_vocab_size
 
   model = Transformer(**model_params, max_context=SEQLEN, jit=False, disable_kv_cache=True)
+
   params = get_parameters(model)
   # weights are all bfloat16 for now
   assert params and all(p.dtype == dtypes.bfloat16 for p in params)
@@ -1381,16 +1382,20 @@ def train_llama3():
 
     vocab_mask.shard_(device, axis=2).realize()
 
-  optim_device = "CPU" if getenv("OFFLOAD_OPTIM") else None
+  is_offload_optim = bool(getenv("OFFLOAD_OPTIM"))
+  is_fake_offload = Device.DEFAULT == "NULL"
+  optim_device = ("CPU" if not is_fake_offload else "NULL:99") if is_offload_optim else None
   optim = GradAccClipAdamW(get_parameters(model), lr=0.0, b1=opt_adamw_beta_1, b2=opt_adamw_beta_2,
                            eps=opt_adamw_epsilon, weight_decay=opt_adamw_weight_decay, grad_acc=grad_acc, device=optim_device)
 
   # init grads
-  for p in optim.params:
-    p.grad = p.empty_like().realize()
+  if is_offload_optim:
+    for p in optim.params:
+      p.grad = Tensor.zeros(p.shape, dtype=p.dtype, device=optim_device, requires_grad=False).contiguous().realize()
+  else:
+    for p in optim.params:
+      p.grad = p.zeros_like().contiguous().realize()
   grads: list[Tensor] = [p.grad for p in optim.params]
-  for p in optim.params:
-    p.grad.assign(p.grad.zeros_like()).realize()
 
   scheduler = CosineAnnealingLRWithWarmup(optim, opt_base_learning_rate, opt_end_learning_rate, opt_learning_rate_warmup_steps, opt_learning_rate_decay_steps)
 
@@ -1426,7 +1431,7 @@ def train_llama3():
     scheduler.step()
 
     for g in grads:
-      g.assign(g.zeros_like()).realize()
+      g.assign(g.zeros_like())
 
     lr_cpu = optim.lr.float().to("CPU")
     grad_norm_cpu = grad_norm.float().to("CPU")

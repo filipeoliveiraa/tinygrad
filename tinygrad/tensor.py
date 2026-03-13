@@ -313,7 +313,14 @@ class Tensor(OpMixin):
     assign_uop = self.uop.assign(x.uop)
     base = self.uop.base
     if base.op in {Ops.BUFFER, Ops.AFTER} and not self.uop.has_buffer_identity():
-      _apply_map_to_tensors({base: base.after(assign_uop)}, name="Embed View Assign", walk=True)
+      original_uop = self.uop
+      assigned_base = base.after(assign_uop)
+      _apply_map_to_tensors({base: assigned_base}, name="Embed View Assign", walk=True)
+      def replace_view_base(u:UOp) -> UOp:
+        return u.replace(src=((assigned_base if u.src[0] is base else replace_view_base(u.src[0])),)+u.src[1:])
+      ret = Tensor(replace_view_base(original_uop), device=self.device, requires_grad=self.requires_grad)
+      self.replace(self._apply_uop(lambda *_: assign_uop, x))
+      return ret
     return self.replace(self._apply_uop(lambda *_: assign_uop, x))
 
   def detach(self) -> Tensor:
@@ -1340,7 +1347,7 @@ class Tensor(OpMixin):
       if is_disk: raise RuntimeError("advanced setitem is not supported for DISK tensors")
       if not isinstance(v, Tensor): v = Tensor(v, device=self.device, dtype=self.dtype)
       self.assign(self._getitem(indices, v))
-    elif is_disk or self.uop.is_realized or self.uop.base.op is Ops.AFTER: # basic setitem, self is realized
+    elif is_disk or self.uop.is_realized or self.uop.base.op in (Ops.AFTER, Ops.BUFFER): # basic setitem, self is realized
       view = self[indices]
       if isinstance(v, Tensor) and v.uop.op is Ops.ASSIGN and v.uop in view.uop.base.src: return
       view.assign(v)

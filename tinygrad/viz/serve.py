@@ -44,7 +44,7 @@ from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphE
 from tinygrad.dtype import dtypes
 
 uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", Ops.VCONST: "#e0e0e0", Ops.REDUCE: "#FF5B5B",
-               **{x:"#f2cb91" for x in {Ops.DEFINE_LOCAL, Ops.DEFINE_REG}}, Ops.REDUCE_AXIS: "#FF6B6B",
+               **{x:"#f2cb91" for x in {Ops.DEFINE_LOCAL, Ops.DEFINE_REG}}, Ops.REDUCE_AXIS: "#FF6B6B", Ops.SHAPED_WMMA: "#FF5B5B",
                Ops.RANGE: "#c8a0e0", Ops.BARRIER: "#ff8080", Ops.IF: "#c8b0c0", Ops.SPECIAL: "#c0c0ff",
                Ops.INDEX: "#cef263", Ops.WMMA: "#efefc0", Ops.MULTI: "#f6ccff", Ops.INS: "#eec4ff",
                **{x:"#D8F9E4" for x in GroupOp.Movement}, **{x:"#ffffc0" for x in GroupOp.ALU}, Ops.THREEFRY:"#ffff80",
@@ -54,7 +54,6 @@ uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", 
                Ops.BUFFERIZE: "#FF991C", Ops.REWRITE_ERROR: "#ff2e2e", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
 
 # VIZ API
-
 
 # A step is a lightweight descriptor for a trace entry
 # Includes a name, metadata and a URL path for fetching the full data
@@ -344,10 +343,14 @@ def sqtt_timeline(data:bytes, lib:bytes, target:str) -> list[ProfileEvent]:
                                           WAVEEND, CDNA_WAVEEND, WAVERDY)
   ret:list[ProfileEvent] = []
   row_ends:dict[str, Decimal] = {}
+  row_counts:dict[str, itertools.count] = {}
   curr_barrier:dict[str, ProfileRangeEvent] = {}
+  exec_pending:dict[str, list[str]] = {}
   NS_PER_TICK = 10  # 100MHz
   prev_pair:tuple[int, int]|None = None # (shader, realtime)
   is_cdna = target.startswith("gfx9")
+  dispatch_to_exec = {"WMMA":"VALU", "VALU":"VALU", "VALUINST":"VALU", "VINTERP":"VALU", "GLOBAL":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU",
+                      "SMEM":"SALU", "VMEM":"VMEM"}
   def add(name:str, p:PacketType, op:str|None=None, wave:int|None=None, info:InstructionInfo|None=None) -> None:
     row = f"WAVE:{wave}" if (wave:=getattr(p, "wave", wave)) is not None else f"{p.__class__.__name__}:0 {name}"
     # barrier on this row extends to fill the time our wave was waiting
@@ -356,7 +359,12 @@ def sqtt_timeline(data:bytes, lib:bytes, target:str) -> list[ProfileEvent]:
     # allow CDNA packets to overlap, NOT allowed on RDNA.
     if (et:=row_ends.get(row)) is not None and e.st < et and not is_cdna: raise RuntimeError(f"packet {p} overlaps another packet in {row}.")
     row_ends[row] = unwrap(e.en)
+    idx = next(row_counts.setdefault(row, itertools.count(0)))
     if name == "BARRIER": curr_barrier[row] = e
+    # queue for exec linking
+    if isinstance(p, (VALUINST, INST, INST_RDNA4)) and (exec_type:=dispatch_to_exec.get(name.split("_")[0])) is not None:
+      exec_pending.setdefault(exec_type, []).append(f"{row}-{idx}")
+    if isinstance(p, (ALUEXEC, VMEMEXEC)) and "ALT" not in str(p.src): e.name = TracingKey(op or name, ret=f"LINK:{exec_pending[name].pop(0)}")
   for p, info in map_insts(data, lib, target):
     if len(ret) > getenv("MAX_SQTT_PKTS", 50_000): break
     if isinstance(p, (TS_DELTA_OR_MARK, TS_DELTA_OR_MARK_RDNA4)) and p.is_marker:

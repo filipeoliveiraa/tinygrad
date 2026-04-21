@@ -1,6 +1,9 @@
 import math, unittest
 from tinygrad import Tensor, dtypes
-from tinygrad.uop.ops import UOp
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, graph_rewrite
+
+_strip_unique_pm = PatternMatcher([(UPat(Ops.CONST, src=(UPat(Ops.UNIQUE), UPat(Ops.DEVICE, name="d")), name="b"), lambda b,d: b.replace(src=(d,))),])
+def _strip_unique(u: UOp) -> UOp: return graph_rewrite(u, _strip_unique_pm)
 
 def _t(*shape):
   return Tensor.arange(math.prod(shape)).reshape(*shape)
@@ -71,6 +74,39 @@ class TestTensorUOpStack(unittest.TestCase):
   def test_stack_3tensors(self): _check(self, _t(2, 3), lambda x: x.stack(x, x, dim=0))
   def test_stack_new_last(self): _check(self, _t(2, 3), lambda x: x.stack(x, dim=-1))
 
+class TestTensorUOpConv2d(unittest.TestCase):
+  def test_conv2d_basic(self):
+    w = _t(1, 1, 2, 2).float()
+    _check(self, _t(1, 1, 3, 3).float(), lambda x: x.conv2d(w if isinstance(x, Tensor) else w.uop))
+  def test_conv2d_padded(self):
+    w = _t(1, 1, 2, 2).float()
+    _check(self, _t(1, 1, 3, 3).float(), lambda x: x.conv2d(w if isinstance(x, Tensor) else w.uop, padding=1))
+  def test_conv2d_negative_padding(self):
+    w = _t(1, 1, 3, 3).float()
+    _check(self, _t(1, 1, 5, 5).float(), lambda x: x.conv2d(w if isinstance(x, Tensor) else w.uop, padding=(-1,-1,-1,-1)))
+  def test_conv2d_multichannel_bias(self):
+    w, b = _t(4, 2, 3, 3).float(), _t(4).float()
+    _check(self, _t(2, 2, 5, 5).float(), lambda x: x.conv2d(*(y if isinstance(x, Tensor) else y.uop for y in (w, b))))
+  def test_conv2d_stride_dilation(self):
+    w = _t(2, 2, 2, 2).float()
+    _check(self, _t(1, 2, 6, 6).float(), lambda x: x.conv2d(w if isinstance(x, Tensor) else w.uop, stride=2, dilation=2))
+  def test_conv2d_groups(self):
+    w = _t(4, 1, 2, 2).float()
+    _check(self, _t(1, 4, 4, 4).float(), lambda x: x.conv2d(w if isinstance(x, Tensor) else w.uop, groups=4))
+  def test_conv2d_3d(self):
+    w = _t(1, 1, 2, 2, 2).float()
+    _check(self, _t(1, 1, 3, 3, 3).float(), lambda x: x.conv2d(w if isinstance(x, Tensor) else w.uop))
+  def test_conv_transpose2d_basic(self):
+    w = _t(1, 1, 2, 2).float()
+    _check(self, _t(1, 1, 3, 3).float(), lambda x: x.conv_transpose2d(w if isinstance(x, Tensor) else w.uop))
+  def test_conv_transpose2d_stride(self):
+    w = _t(1, 1, 2, 2).float()
+    _check(self, _t(1, 1, 3, 3).float(), lambda x: x.conv_transpose2d(w if isinstance(x, Tensor) else w.uop, stride=2))
+
+class TestTensorUOpEinsum(unittest.TestCase):
+  def test_einsum_dot(self):       _check(self, _t(2, 3), lambda x: type(x).einsum("ij,ij->", x, x))
+  def test_einsum_transpose(self): _check(self, _t(2, 3), lambda x: type(x).einsum("ij->ji", x))
+
 class TestTensorUOpSoftmax(unittest.TestCase):
   def test_softmax_default(self):     _check(self, _t(2, 3).float(), lambda x: x.softmax())
   def test_softmax_axis0(self):       _check(self, _t(2, 3).float(), lambda x: x.softmax(axis=0))
@@ -99,6 +135,24 @@ class TestUOpEmpty(unittest.TestCase):
     # regression: direct UOp.empty with a singleton-tuple device + axis must not trip .multi()'s tuple assert
     u = UOp.empty((4,), dtype=dtypes.float32, device=("NULL:0",), axis=0)
     self.assertEqual((u.shape, u.device, u.axis), ((4,), "NULL", None))
+
+class TestTensorUOpFull(unittest.TestCase):
+  def test_full(self):
+    self.assertIs(_strip_unique(Tensor.full((2, 3), 42).uop), _strip_unique(UOp.full((2, 3), 42)))
+  def test_full_kwargs(self):
+    self.assertIs(_strip_unique(Tensor.full((2, 3), 42, dtype=dtypes.int8, device="NULL").uop),
+                  _strip_unique(UOp.full((2, 3), 42, dtype=dtypes.int8, device="NULL")))
+  def test_full_symbolic_fill(self):
+    # bound symbolic variable — flows through Tensor.__init__'s UOp branch, no UNIQUE added
+    t = Tensor.full((2, 3), UOp.variable("x", 1, 10).bind(5))
+    self.assertEqual(t.shape, (2, 3))
+    self.assertFalse(t.uop.op_in_backward_slice_with_self(Ops.UNIQUE))
+  def test_zeros(self):
+    self.assertIs(_strip_unique(Tensor.zeros(2, 3).uop), _strip_unique(UOp.zeros(2, 3)))
+  def test_ones(self):
+    self.assertIs(_strip_unique(Tensor.ones(2, 3).uop), _strip_unique(UOp.ones(2, 3)))
+  def test_invalids(self):
+    self.assertIs(_strip_unique(Tensor.invalids(2, 3, dtype=dtypes.int8).uop), _strip_unique(UOp.invalids(2, 3, dtype=dtypes.int8)))
 
 if __name__ == "__main__":
   unittest.main()

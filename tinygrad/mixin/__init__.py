@@ -1,17 +1,86 @@
+from __future__ import annotations
 import functools, itertools
-from typing import Self, Sequence, Literal, get_args
+from typing import TYPE_CHECKING, Self, Sequence, Literal, get_args
 from tinygrad.mixin.elementwise import ElementwiseMixin
 from tinygrad.mixin.movement import MovementMixin
 from tinygrad.mixin.reduce import ReduceMixin
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import _broadcast_shape, resolve, smax, smin, identity_element
-from tinygrad.dtype import DTypeLike, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype
-from tinygrad.helpers import argfix, flatten, prod, round_up
+from tinygrad.dtype import ConstType, DTypeLike, Invalid, dtypes, least_upper_dtype, sum_acc_dtype, to_dtype
+from tinygrad.helpers import argfix, flatten, flat_to_grouped, make_tuple, prod, resolve_pool_pads, round_up
+
+if TYPE_CHECKING:
+  from tinygrad.uop.ops import sint
 
 ReductionStr = Literal["mean", "sum", "none"]
 
 
 class OpMixin(ElementwiseMixin, ReduceMixin):
+  @staticmethod
+  def unique_const(fill_value:ConstType, **kwargs): raise NotImplementedError("creation helpers are only supported on Tensor and UOp")
+
+  @classmethod
+  def full(cls, shape:tuple[sint, ...], fill_value:ConstType, **kwargs) -> Self:
+    """
+    Creates a tensor with the given shape, filled with the given value.
+
+    You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
+    Additionally, all other keyword arguments are passed to the constructor of the tensor.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.full((2, 3), 42).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.full((2, 3), False).numpy())
+    ```
+    """
+    return cls.unique_const(fill_value, **kwargs).reshape((1,)*len(new_shape := argfix(shape))).expand(new_shape)
+
+  @classmethod
+  def invalids(cls, *shape, **kwargs) -> Self:
+    """
+    Creates a tensor with the given shape, filled with Invalid.
+
+    This is an alternative to Tensor.empty when you want an "anonymous" buffer.
+
+    Eventually Tensor.empty will be replaced by this.
+    """
+    return cls.full(argfix(*shape), Invalid, **kwargs)
+
+  @classmethod
+  def zeros(cls, *shape, **kwargs) -> Self:
+    """
+    Creates a tensor with the given shape, filled with zeros.
+
+    You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
+    Additionally, all other keyword arguments are passed to the constructor of the tensor.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.zeros(2, 3).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.zeros(2, 3, dtype=dtypes.int32).numpy())
+    ```
+    """
+    return cls.full(argfix(*shape), 0.0, **kwargs)
+
+  @classmethod
+  def ones(cls, *shape, **kwargs) -> Self:
+    """
+    Creates a tensor with the given shape, filled with ones.
+
+    You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
+    Additionally, all other keyword arguments are passed to the constructor of the tensor.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.ones(2, 3).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.ones(2, 3, dtype=dtypes.int32).numpy())
+    ```
+    """
+    return cls.full(argfix(*shape), 1.0, **kwargs)
+
   def _pad_constant(self, pX, value:float) -> Self:
     # shrink first for negative pads, then pad with only non-negative values
     pX = tuple((0, 0) if p is None else p for p in pX)
@@ -416,6 +485,61 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
       return self.cast(dt).linear(weight.cast(dt), bias.cast(dt) if bias is not None else bias)
     x = self.mul(weight) if len(weight.shape) == 1 else self.dot(weight)
     return x.add(bias) if bias is not None else x
+
+  def conv2d(self, weight:Self, bias:Self|None=None, groups=1, stride=1, dilation=1, padding:int|Sequence[int]=0,
+             dtype:DTypeLike|None=None) -> Self:
+    (bs,cin_), (cout,cin), HW = self.shape[:2], weight.shape[:2], weight.shape[2:]
+    padding_ = resolve_pool_pads(padding, len(HW))
+    assert groups*cin == cin_ and len(self.shape) == len(weight.shape),\
+        f"Input Tensor shape {self.shape} does not match the shape of the weights {weight.shape}. ({groups*cin} vs. {cin_})"
+    # conv2d is a pooling op (with padding, possibly negative — _pad_constant handles the shrink)
+    x = self._pad_constant(((0,0),)*(self.ndim-len(HW)) + flat_to_grouped(padding_), 0.0)._pool(HW, stride, dilation)
+    rcout, oyx = cout//groups, x.shape[2:-len(HW)]
+    x = x.reshape(bs, groups, cin, 1, *oyx, *HW).expand(bs, groups, cin, rcout, *oyx, *HW)\
+      .permute(0,1,3,*[4+i for i in range(len(oyx))],2,*[4+len(oyx)+i for i in range(len(HW))])
+    # conv! broadcasted to (bs, groups, rcout, *oyx, cin, *HW)
+    ret = (x * weight.reshape(1, groups, rcout, *[1] * len(oyx), cin, *HW))\
+      .sum([-1-i for i in range(1+len(oyx))], keepdim=True, dtype=dtype).reshape(bs, cout, *oyx)
+    return ret if bias is None else ret.add(bias.reshape(1, -1, *[1] * len(HW)))
+
+  def conv_transpose2d(self, weight:Self, bias:Self|None=None, groups=1, stride=1, dilation=1, padding=0, output_padding=0) -> Self:
+    """
+    Applies a transposed convolution over a tensor with a given `weight` and optional `bias`.
+
+    This function supports three different types of `padding`
+
+    1. `int` (single value):
+      Applies the same padding value uniformly to all spatial dimensions.
+
+    2. `tuple[int, ...]` (length = number of spatial dimensions):
+      Specifies a distinct padding value for each spatial dimension in the form `(padding_height, padding_width, ...)`.
+
+    3. `tuple[int, ...]` (length = 2 * number of spatial dimensions):
+      Specifies explicit padding for each side of each spatial dimension in the form
+      `(padding_left, padding_right, padding_top, padding_bottom, ...)`.
+
+    NOTE: unlike PyTorch, this implementation is not limited to only 2d transposed convolutions and instead works for any number of dimensions.
+
+    See: https://pytorch.org/docs/stable/generated/torch.nn.ConvTranspose2d.html
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor.arange(9).reshape(1, 1, 3, 3)
+    w = Tensor.ones(1, 1, 2, 2)
+    print(t.conv_transpose2d(w).numpy())
+    ```
+    """
+    x, w = self, weight.unflatten(0, (groups, -1)).transpose(1, 2).flip(*range(3, len(weight.shape)+1))
+    HW = weight.shape[2:]
+    padding = flat_to_grouped(resolve_pool_pads(padding, len(HW)))
+    stride, dilation, output_padding = [make_tuple(x, len(HW)) for x in (stride, dilation, output_padding)]
+    if any(s>1 for s in stride):
+      # handle strides: (k) -> reshape -> (k,1) -> pad -> (k,s) -> reshape -> (k*s) -> shrink (k-(s-1))
+      x = x.reshape(None, None, *flatten((k,1) for k in x.shape[2:]))
+      x = x.pad((None, None, *flatten((None,(0,s-1)) for s in stride)))
+      x = x.reshape(None, None, *[k*s for k,s in zip(x.shape[2::2], stride)])
+      x = x.shrink_to(None, None, *[k-(s-1) for k,s in zip(x.shape[2:], stride)])
+    padding = flatten((((k-1)*d-pB,(k-1)*d-pA+op) for k,d,(pB,pA),op in reversed(list(zip(HW, dilation, padding, output_padding)))))
+    return x.conv2d(w.flatten(end_dim=1), groups=groups, bias=bias, dilation=dilation, padding=padding)
 
   def layernorm(self, axis:int|tuple[int,...]=-1, eps:float=1e-5) -> Self:
     """

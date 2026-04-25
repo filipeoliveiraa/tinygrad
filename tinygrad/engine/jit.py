@@ -1,14 +1,13 @@
 from typing import TypeVar, Generic, Callable, Any
 import functools, collections
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, pluralize, VIZ, unwrap
+from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, colored, JIT, JIT_BATCH_SIZE, dedup, pluralize, VIZ
 from tinygrad.device import Buffer, Compiled, Device, MultiBuffer
 from tinygrad.dtype import DType, dtypes
 from tinygrad.uop.ops import UOp, PatternMatcher, Variable, sym_infer, Ops, buffers, track_rewrites, graph_rewrite
-from tinygrad.engine.realize import ExecItem, capturing, CompiledRunner, Runner, Estimates, compile_linear, run_linear, get_runner, graph_cache
+from tinygrad.engine.realize import capturing, CompiledRunner, Runner, Estimates, compile_linear, run_linear, get_runner, graph_cache, estimate_uop
 from tinygrad.engine.realize import unwrap_multi, resolve_params
 from tinygrad.schedule.memory import memory_plan_rewrite, _collect_bufs
-from tinygrad.schedule import linear_to_schedule
 from tinygrad.nn.state import get_parameters
 from tinygrad.schedule.rangeify import mop_cleanup
 from dataclasses import dataclass
@@ -98,22 +97,9 @@ def _check_no_non_tensor_return(ret):
 
 def graph_class(dev): return dev.graph.func if isinstance(dev.graph, functools.partial) else dev.graph
 
-def get_input_replace(jit_cache: list[ExecItem], input_buffers:list[Buffer]) -> dict[tuple[int, int], int]:
-  input_replace: dict[tuple[int, int], int] = {}
-  for j,ji in enumerate(jit_cache):
-    for i,a in enumerate(ji.bufs):
-      if a in input_buffers: input_replace[(j,i)] = input_buffers.index(a)
-  return input_replace
-
 class GraphRunner(Runner):
-  def __init__(self, linear:UOp, input_buffers:list[Buffer], input_uops:tuple[UOp, ...]=()):
+  def __init__(self, linear:UOp, input_uops:tuple[UOp, ...]=()):
     self.linear = linear.src[0]
-    self.jit_cache = [ei.lower() for ei in linear_to_schedule(self.linear.substitute({p: input_uops[p.arg] for p in linear.src[1:]}))]
-    for ei in self.jit_cache:
-      for b in ei.bufs:
-        if b is not None: b.ensure_allocated()
-    self.input_replace = get_input_replace(self.jit_cache, input_buffers) if input_buffers else {}
-
     self.calls: list[tuple[int, UOp, list[Buffer], dict[str, int]]] = []
     self.progs: list[CompiledRunner|None] = []
     self.uop_replace: list[list[tuple[int, int]]] = []
@@ -145,18 +131,13 @@ class GraphRunner(Runner):
         assert p.p.local_size is not None
         self.launch_dims_base[j] = (tuple(p.p.global_size), tuple(p.p.local_size))
 
-    estimates = Estimates()
-    for (_, ast, bufs, _), pr in zip(self.calls, self.progs):
-      if ast.op in (Ops.SINK, Ops.PROGRAM): estimates += unwrap(pr).estimates
-      elif ast.op is Ops.COPY or (ast.op is Ops.CUSTOM_FUNCTION and ast.arg == "encdec"):
-        estimates += Estimates(lds=bufs[0].nbytes, mem=bufs[0].nbytes)
+    estimates = sum((estimate_uop(call) for call in self.linear.src), Estimates())
 
     # used in MultiGraphRunner. tracks (offset, end, dep) ranges per base buffer id to handle suballocated buffers correctly.
     self.w_dependency_map: dict[int, list[tuple[int, int, Any]]] = collections.defaultdict(list)
     self.r_dependency_map: dict[int, list[tuple[int, int, Any]]] = collections.defaultdict(list)
 
-    assert self.jit_cache[0].prg is not None
-    super().__init__(colored(f"<batched {len(self.jit_cache)}>", "cyan"), self.jit_cache[0].prg.device.split(":")[0], estimates.simplify())
+    super().__init__(colored(f"<batched {len(self.calls)}>", "cyan"), self.calls[0][2][0].device.split(":")[0], estimates.simplify())
 
   def updated_vars(self, var_vals: dict[str, int]):
     vals = [var_vals[v] for v in self.vars]

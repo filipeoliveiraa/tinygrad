@@ -11,7 +11,7 @@ from tinygrad.helpers import resolve_pool_pads, IMAGE, FLOAT16, WINO, Metadata, 
 from tinygrad.helpers import suppress_finalizing, disable_gc
 from tinygrad.gradient import compute_gradient
 from tinygrad.mixin import OpMixin
-from tinygrad.uop.ops import smax, UOp, Ops, sint, all_metadata, _index_to_concrete_int, Variable, _broadcast_shape
+from tinygrad.uop.ops import UOp, Ops, sint, all_metadata, _index_to_concrete_int, Variable, _broadcast_shape
 from tinygrad.schedule import create_linear_with_vars
 from tinygrad.device import Buffer, canonicalize_device
 from tinygrad.engine.realize import run_linear
@@ -909,71 +909,6 @@ class Tensor(OpMixin):
 
   def _mop(self, op:Ops, arg) -> Tensor: return self._apply_uop(UOp._mop, extra_args=(op,), arg=arg)
   def _rop(self, op:Ops, axis:tuple[int, ...]) -> Tensor: return self._apply_uop(UOp._rop, op=op, axis=axis)
-
-  def _pad_circular(self, pX:tuple[tuple[sint, sint], ...]) -> Tensor:
-    if any(pB>sh or pA>sh for (pB,pA),sh in zip(pX, self.shape)): raise ValueError('Padding value causes wrapping around more than once.')
-    if any(pB<0 or pA<0 for pB,pA in pX): raise NotImplementedError("Negative pads with circular pads is not supported")
-    orig_shape, X = self.shape, self.repeat(tuple(1 + bool(pB) + bool(pA) for pB,pA in pX))
-    return X.shrink(tuple((0 if pB == 0 else osh-pB, xsh if pA == 0 else xsh-osh+pA) for (pB,pA),osh,xsh in zip(pX, orig_shape, X.shape)))
-
-  def _pad_reflect_replicate(self, pX:tuple[tuple[sint, sint], ...], mode:str) -> Tensor:
-    X, pads = self, tuple((smax(pB,0), smax(pA,0)) for pB,pA in pX)
-    for d,(pB,pA) in enumerate(pads):
-      if mode == "reflect":
-        if pB >= (s:=X.shape[d]) or pA>=s: raise ValueError(f"Padding ({pB}, {pA}) should be less than the input size={s} for dim={d}.")
-        slcB, slcA = slice(pB,0,-1), slice(s-2 if s-2>=0 else None, s-2-pA if s-2-pA>=0 else None, -1)
-        xB, xA = (X[[slc if i == d else slice(None) for i in range(X.ndim)]] if p > 0 else None for slc, p in ((slcB, pB), (slcA, pA)))
-      else:
-        shrB, shrA = tuple((0,1) if i==d else None for i in range(X.ndim)), tuple((X.shape[i]-1,X.shape[i]) if i==d else None for i in range(X.ndim))
-        xB, xA = (X.shrink(shr).expand(tuple(p if i==d else None for i in range(X.ndim))) if p > 0 else None for shr, p in ((shrB, pB), (shrA, pA)))
-      X = Tensor.cat(*(X_ for X_ in (xB, X, xA) if X_ is not None), dim=d)
-    # shrink after for negative pads (reflection/replication must see full data first)
-    return X.shrink(tuple((-min(pB,0), min(pA+s,s)) for (pB,pA),s in zip(pX, X.shape)))
-
-  def pad(self, padding:Sequence[sint]|Sequence[tuple[sint, sint]|None], mode:str="constant", value:float=0.0) -> Tensor:
-    """
-    Returns a tensor with padding applied based on the input `padding`.
-
-    `padding` supports two padding structures:
-
-    1. Flat padding: `(padding_left, padding_right, padding_top, padding_bottom, ...)`
-        - This structure matches PyTorch's pad.
-        - `padding` length must be even.
-
-    2. Group padding: `(..., (padding_top, padding_bottom), (padding_left, padding_right))`
-        - This structure matches pad for JAX, NumPy, TensorFlow, and others.
-        - For each axis, padding can be `None`, meaning no padding, or a tuple `(start, end)`.
-        - `padding` must have the same length as `self.ndim`.
-
-    Padding values can be negative, resulting in dimension shrinks that work similarly to Python negative slices.
-    Padding modes is selected with `mode` which supports `constant`, `reflect` and `replicate`.
-
-    ```python exec="true" source="above" session="tensor" result="python"
-    t = Tensor.arange(9).reshape(1, 1, 3, 3)
-    print(t.numpy())
-    ```
-    ```python exec="true" source="above" session="tensor" result="python"
-    print(t.pad((1, 2, 0, -1)).numpy())
-    ```
-    ```python exec="true" source="above" session="tensor" result="python"
-    print(t.pad(((None, None, (0, -1), (1, 2)))).numpy())
-    ```
-    ```python exec="true" source="above" session="tensor" result="python"
-    print(t.pad((1, 2, 0, -1), value=-float('inf')).numpy())
-    ```
-    """
-    # normalize to grouped format
-    if all(isinstance(p, (int,UOp)) for p in padding):
-      if len(padding)%2 != 0: raise ValueError("Flat padding must have even number of pads")
-      pX = ((0,0),)*(self.ndim - len(padding)//2) + flat_to_grouped(cast(Sequence[sint], padding))
-    else: pX = tuple((0,0) if p is None else p for p in cast(Sequence[tuple[sint, sint]|None], padding))
-    if len(pX) != self.ndim: raise ValueError(f"padding length is improper, {padding=} {self.ndim=}")
-    # dispatch
-    if mode == "constant": return self._pad_constant(pX, value)
-    assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
-    if mode == "circular": return self._pad_circular(pX)
-    if mode in {"reflect", "replicate"}: return self._pad_reflect_replicate(pX, mode)
-    raise NotImplementedError(f"{mode=} is not supported")
 
   def _getitem(self, indices, v: Tensor|None = None) -> Tensor:
     # view-only indexing (no Tensor/list indices, no setitem) is handled by MovementMixin.__getitem__

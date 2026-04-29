@@ -212,7 +212,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     match self.op:
       # late ops don't have shape
       case Ops.UNIQUE | Ops.LUNIQUE | Ops.DEVICE | Ops.IF | Ops.BARRIER | Ops.CUSTOM | Ops.CUSTOMI | \
-           Ops.STACK | Ops.GEP | Ops.UNROLL | Ops.CONTRACT | Ops.SINK | \
+           Ops.STACK | Ops.GEP | Ops.UNROLL | Ops.CONTRACT | Ops.SINK | Ops.END | \
            Ops.LINEAR | Ops.PROGRAM | Ops.SOURCE | Ops.BINARY | Ops.INS | Ops.TUPLE | Ops.CALL | Ops.FUNCTION:
         return None
 
@@ -259,7 +259,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case Ops.SHAPED_WMMA: return self.src[2]._shape
 
       # passthrough ops
-      case Ops.REDUCE | Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.END | Ops.LOAD:
+      case Ops.REDUCE | Ops.MSTACK | Ops.MSELECT | Ops.DETACH | Ops.CONTIGUOUS | Ops.CONTIGUOUS_BACKWARD | Ops.AFTER | Ops.LOAD:
         return self.src[0]._shape
 
       # TODO: disallow shape changing bitcast
@@ -452,7 +452,7 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
     if dtype.count == 1 and dtype.count != self.dtype.count: dtype = dtype.vec(self.dtype.count)
     if self.dtype == dtype: return self
     return UOp(Ops.CAST, dtype, (self,))
-  def bitcast(self, dtype:DType): return UOp(Ops.BITCAST, dtype, (self,))
+  def bitcast(self, dtype:DType): return self if self.dtype == dtype else UOp(Ops.BITCAST, dtype, (self,))
   def gep(self, i:tuple[int, ...]|int):
     if isinstance(i, tuple) and len(i) == 1: return self.gep(i[0])
     if isinstance(i, int):
@@ -969,8 +969,7 @@ class KernelInfo:
 @dataclass(frozen=True)
 class ProgramInfo:
   name: str = "test"
-  device: str = ""
-  global_size: tuple[int, ...] = (1, 1, 1)
+  global_size: tuple[int|float, ...] = (1, 1, 1)
   local_size: tuple[int, ...]|None = None
   vars: tuple[UOp, ...] = ()
   globals: tuple[int, ...] = ()
@@ -984,13 +983,15 @@ class ProgramInfo:
   @property
   def runtimevars(self) -> dict[str, int]: return {v.expr: i for i, v in enumerate(self.vars) if v.expr == 'core_id'}
 
-  def launch_dims(self, var_vals:dict[str, int]):
-    global_size = [sym_infer(sz, var_vals) for sz in self.global_size]
-    local_size = [sym_infer(sz, var_vals) for sz in self.local_size] if self.local_size is not None else None
+  def launch_dims(self, var_vals:dict[str, int]) -> tuple[tuple[int, ...], tuple[int, ...]|None]:
+    global_size = tuple([sym_infer(sz, var_vals) for sz in self.global_size])  # type: ignore[arg-type]
+    local_size = tuple([sym_infer(sz, var_vals) for sz in self.local_size]) if self.local_size is not None else None
     return global_size, local_size
 
+  def vals(self, var_vals:dict[str, int]): return tuple(var_vals[k.expr] if k.expr not in self.runtimevars else None for k in self.vars)
+
   @staticmethod
-  def from_sink(sink:UOp, device:str, aux:tuple=()) -> ProgramInfo:
+  def from_sink(sink:UOp, aux:tuple=()) -> ProgramInfo:
     _vars: list[UOp] = []
     _globals: list[int] = []
     outs: list[int] = []
@@ -1008,7 +1009,7 @@ class ProgramInfo:
         special_size = local_size if u.arg[0] == 'l' else global_size
         if special_size is not None: special_size[int(u.arg[-1])] = cast(int, u.src[0].ssimplify())
       if u.op is Ops.DEFINE_VAR and u.arg[0] == 'core_id': global_size[0] = u.arg[2] + 1
-    return ProgramInfo(sink.arg.name if isinstance(sink.arg, KernelInfo) else "test", device, tuple(global_size),
+    return ProgramInfo(sink.arg.name if isinstance(sink.arg, KernelInfo) else "test", tuple(global_size),
                        tuple(local_size) if local_size is not None else None, tuple(sorted(_vars, key=lambda v: v.arg)),
                        tuple(sorted(dedup(_globals))), tuple(sorted(dedup(outs))), tuple(sorted(dedup(ins))), aux)
 

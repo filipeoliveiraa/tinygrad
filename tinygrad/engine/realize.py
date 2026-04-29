@@ -1,14 +1,14 @@
-from typing import cast, Callable, Iterator
+from typing import cast, Iterator, Any
 import time, random, itertools, math, contextlib, weakref
 from dataclasses import dataclass, replace, field
-from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansilen, NOOPT, all_int, Metadata, TRACEMETA, TracingKey
-from tinygrad.helpers import BEAM, DEVECTORIZE, size_to_str, time_to_str, VALIDATE_WITH_CPU, cpu_profile, PROFILE, ProfilePointEvent, cpu_events
-from tinygrad.helpers import prod, EMULATED_DTYPES, flatten
+from tinygrad.helpers import colored, DEBUG, GlobalCounters, ansilen, all_int, Metadata, TRACEMETA, TracingKey, prod, flatten
+from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, cpu_profile, PROFILE, ProfilePointEvent, cpu_events
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, sym_infer, buffers, graph_rewrite, ProgramInfo
 from tinygrad.device import Device, Buffer, MultiBuffer
 from tinygrad.renderer import Estimates
 from tinygrad.codegen import to_program
+from tinygrad.codegen.opt.postrange import bufs_from_ast
 
 # **************** Stat ****************
 
@@ -43,6 +43,22 @@ def update_stats(display_name:str, device:str, estimates:Estimates, var_vals:dic
       ("" if et is None else f" tm {ptm}/{GlobalCounters.time_sum_s*1e3:9.2f}ms ({flops_str} {mem_str})")+
       f" {[repr(m) if TRACEMETA >= 2 else str(m) for m in metadata] if metadata else ''}")
 
+first_run_cache:set[bytes] = set()
+@contextlib.contextmanager
+def track_stats(ctx:"ExecContext", call:UOp, device:str, display_name:str, bufs:list[Buffer], var_vals:dict[str, int], outputs=(0,), inputs=(1,)):
+  if PROFILE: cpu_events.append(ProfilePointEvent(device, "exec", len(cpu_events), {"metadata": call.arg.metadata, "var_vals": var_vals,
+                                                  "bufs": [b.trace_num for b in bufs], "name": display_name, "outputs": outputs, "inputs": inputs}))
+  timing: list[float|None] = [None]
+  if DEBUG >= 2: st = time.perf_counter()
+  yield timing
+  if not ctx.do_update_stats: return
+  if DEBUG >= 2 and timing[0] is None:
+    Device[device].synchronize()
+    timing[0] = time.perf_counter() - st
+  update_stats(display_name, device, estimate_uop(call), var_vals, timing[0], len(bufs), jit=ctx.jit, metadata=call.arg.metadata,
+               first_run=call.src[0].key not in first_run_cache)
+  first_run_cache.add(call.src[0].key)
+
 # **************** Runners ****************
 
 class Runner:
@@ -55,63 +71,61 @@ class Runner:
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int], wait=False) -> float|None:
     raise NotImplementedError("override this")
 
-def optimize_local_size(_prg:Callable, global_size:list[int], rawbufs:list[Buffer]) -> list[int]:
-  test_rawbuffers = [Buffer(rawbufs[0].device, rawbufs[0].size, rawbufs[0].dtype).allocate(), *rawbufs[1:]] if rawbufs[0] in rawbufs[1:] else rawbufs
-  MAX_WORKGROUP = 1024
-  local_dims = [[x for x in set([sz, 1, 2, 4, 8, 16, 32, 64, 128, 256, MAX_WORKGROUP]) if x<=sz] for sz in global_size]
-  local_sizes = [list(x) for x in itertools.product(*local_dims) if prod(x) <= MAX_WORKGROUP] * 2  # try each valid size twice
-  def try_exec(local_size):
-    try:
-      return _prg(*[x._buf for x in test_rawbuffers],global_size=[g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)],
-                  local_size=local_size, wait=True)
-    except Exception: return float('inf')
-  ret = min([(try_exec(local_size), local_size) for local_size in random.sample(local_sizes, len(local_sizes))])
-  assert not math.isinf(ret[0]), "all optimize_local_size exec failed"
-  return ret[1]
+local_size_cache: dict[bytes, tuple[int, ...]] = {}
+def optimize_local_size(call:UOp, prg:UOp) -> UOp|None:
+  device = prg.src[1].arg
+  if prg.arg.local_size is not None or not Device[device].renderer.has_local or not all_int(prg.arg.global_size): return None
+
+  if (local_size:=local_size_cache.get(prg.key)) is None:
+    bufs = [b._buf for b in (b.allocate() for b in bufs_from_ast(prg.src[0], device))]
+    rt = Device[device].runtime(prg.arg.function_name, prg.src[4].arg, *prg.arg.aux, runtimevars=prg.arg.runtimevars)
+    def try_exec(local_size):
+      try: return rt(*bufs, global_size=[g//l if g%l == 0 else g/l for g,l in zip(prg.arg.global_size, local_size)], local_size=local_size, wait=True)
+      except Exception: return float('inf')
+
+    MAX_WORKGROUP = 1024
+    local_dims = [[x for x in set([sz, 1, 2, 4, 8, 16, 32, 64, 128, 256, MAX_WORKGROUP]) if x<=sz] for sz in prg.arg.global_size]
+    local_sizes = [list(x) for x in itertools.product(*local_dims) if prod(x) <= MAX_WORKGROUP] * 2  # try each valid size twice
+    best_time, best = min([(try_exec(ls), ls) for ls in random.sample(local_sizes, len(local_sizes))])
+    assert not math.isinf(best_time), "all optimize_local_size exec failed"
+    local_size = local_size_cache[prg.key] = tuple(best)
+
+  new_global = tuple(g//l if g%l == 0 else g/l for g,l in zip(prg.arg.global_size, local_size))
+  return call.replace(src=(prg.replace(arg=replace(prg.arg, global_size=new_global, local_size=local_size)), *call.src[1:]))
 
 class CompiledRunner(Runner):
-  def __init__(self, prg:UOp, _prg=None):
+  def __init__(self, prg:UOp, device:str):
     info: ProgramInfo = prg.arg
     sink = prg.src[0]
     if DEBUG >= 3 and sink.arg.applied_opts: print(sink.arg.applied_opts)
     if DEBUG >= 4: print(prg.src[3].arg)
     if len(prg.src) <= 4 or prg.src[4].op is not Ops.BINARY:
       with cpu_profile(TracingKey(f"compile {info.name}", (info.function_name,)), "TINY"):
-        lib = Device[info.device].compiler.compile_cached(prg.src[3].arg)
+        lib = Device[device].compiler.compile_cached(prg.src[3].arg)
       prg = prg.replace(src=prg.src + (UOp(Ops.BINARY, arg=lib),))
     self.prg:UOp = prg
     self.p:ProgramInfo = info
-    if DEBUG >= 7: Device[info.device].compiler.disassemble(prg.src[4].arg)
-    self._prg = Device[info.device].runtime(info.function_name, prg.src[4].arg, *info.aux, runtimevars=info.runtimevars) if _prg is None else _prg
-    super().__init__(info.name, info.device, sink.arg.estimates or Estimates())
-
-  def __reduce__(self): return self.__class__, (self.prg,)
+    if DEBUG >= 7: Device[device].compiler.disassemble(prg.src[4].arg)
+    self._prg = Device[device].runtime(info.function_name, prg.src[4].arg, *info.aux, runtimevars=info.runtimevars)
+    super().__init__(info.name, device, sink.arg.estimates or Estimates())
 
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[str, int]|None=None, wait=False, timeout:int|None=None) -> float|None:
     if var_vals is None: var_vals = {}
     global_size, local_size = self.p.launch_dims(var_vals)
-    if Device[self.p.device].renderer.has_local and local_size is None and all_int(self.p.global_size):
-      local_size = optimize_local_size(self._prg, global_size, rawbufs)
-      global_size = [g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)]
-      self.p = replace(self.p, global_size=tuple(global_size), local_size=tuple(local_size))
     return self._prg(*[x._buf for x in rawbufs], global_size=tuple(global_size), local_size=tuple(local_size) if local_size else None,
                      vals=tuple(var_vals[k.expr] if k.expr not in self.p.runtimevars else None for k in self.p.vars), wait=wait, timeout=timeout)
 
 # **************** method cache ****************
 
-method_cache: dict[tuple[str, type, bytes, tuple, bool], CompiledRunner] = {}
-def get_runner(device:str, ast:UOp) -> CompiledRunner:
-  # TODO: this should be all context relevant to rendering
-  context = (NOOPT.value, DEVECTORIZE.value, EMULATED_DTYPES.value)
-  ckey = (device, type(Device[device].compiler), ast.key, context, False)
-  if cret:=method_cache.get(ckey): return cret
-  bkey = (device.split(":")[0], type(Device[device].compiler), ast.key, context, True)
-  if bret:=method_cache.get(bkey):
-    method_cache[ckey] = ret = CompiledRunner(bret.prg.replace(arg=replace(bret.p, device=device)))
-  else:
-    prg = to_program(ast, Device[device].renderer)
-    method_cache[ckey] = method_cache[bkey] = ret = CompiledRunner(prg.replace(arg=replace(prg.arg, device=device)))
-  return ret
+runtime_cache: dict[tuple[bytes, str], Any] = {}
+def get_runtime(device:str, ast:UOp):
+  assert ast.op is Ops.PROGRAM and isinstance(ast.arg, ProgramInfo), "get_runtime should only be called with a PROGRAM ast"
+  if (runtime:=runtime_cache.get(key:=(ast.key, device))) is None:
+    if DEBUG >= 3 and ast.src[0].arg.applied_opts: print(ast.src[0].arg.applied_opts)
+    if DEBUG >= 4: print(ast.src[3].arg)
+    if DEBUG >= 7: Device[device].compiler.disassemble(ast.src[4].arg)
+    runtime = runtime_cache[key] = Device[device].runtime(ast.arg.function_name, ast.src[4].arg, *ast.arg.aux, runtimevars=ast.arg.runtimevars)
+  return runtime
 
 # **************** run linear ****************
 
@@ -128,20 +142,6 @@ def _resolve(b:UOp, inputs:tuple[UOp, ...]) -> UOp:
   if b.op in (Ops.BUFFER_VIEW, Ops.MSELECT) and b.src[0].op is Ops.PARAM: return b.replace(src=(inputs[b.src[0].arg], *b.src[1:]))
   return inputs[b.arg] if b.op is Ops.PARAM else b
 def resolve_params(call:UOp, inputs:tuple[UOp, ...]) -> list[UOp]: return [_resolve(b, inputs) for b in call.src[1:] if b.op is not Ops.BIND]
-
-@contextlib.contextmanager
-def track_stats(ctx:ExecContext, call:UOp, device:str, display_name:str, bufs:list[Buffer], var_vals:dict[str, int],
-                outputs=(0,), inputs=(1,), first_run=False):
-  if PROFILE: cpu_events.append(ProfilePointEvent(device, "exec", len(cpu_events), {"metadata": call.arg.metadata, "var_vals": var_vals,
-                                                  "bufs": [b.trace_num for b in bufs], "name": display_name, "outputs": outputs, "inputs": inputs}))
-  timing: list[float|None] = [None]
-  if DEBUG >= 2: st = time.perf_counter()
-  yield timing
-  if not ctx.do_update_stats: return
-  if DEBUG >= 2 and timing[0] is None:
-    Device[device].synchronize()
-    timing[0] = time.perf_counter() - st
-  update_stats(display_name, device, estimate_uop(call), var_vals, timing[0], len(bufs), jit=ctx.jit, metadata=call.arg.metadata, first_run=first_run)
 
 def unwrap_multi(call:UOp, resolved:list[UOp]) -> Iterator[tuple[list[Buffer], dict[str, int]]]:
   bufs = [b.buffer for b in resolved]
@@ -175,21 +175,21 @@ def exec_copy(ctx:ExecContext, call, ast):
 def exec_kernel(ctx:ExecContext, call, ast):
   for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
     var_vals = {**ctx.var_vals, **device_vars}
-    prg = get_runner(bufs[0].device, ast)
-    prg_bufs = [bufs[i].ensure_allocated() for i in prg.p.globals]
-
-    with track_stats(ctx, call, prg.device, prg.display_name, prg_bufs, var_vals,
-                     outputs=tuple(prg.p.outs), inputs=tuple(prg.p.ins), first_run=prg.first_run) as timing:
-      timing[0] = prg(prg_bufs, var_vals, wait=DEBUG >= 2)
-      prg.first_run = False
+    prg_bufs = [bufs[i].ensure_allocated() for i in ast.arg.globals]
+    rt = get_runtime(device:=bufs[0].device, ast)
+    global_size, local_size = ast.arg.launch_dims(var_vals)
+    with track_stats(ctx, call, device, ast.arg.name, prg_bufs, var_vals, outputs=ast.arg.outs, inputs=ast.arg.ins) as tm:
+      tm[0] = rt(*[b._buf for b in prg_bufs], global_size=global_size, local_size=local_size, vals=ast.arg.vals(var_vals), wait=DEBUG>=2)
 
 def exec_validate(ctx:ExecContext, call, ast):
   import numpy as np
   for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
-    cpu_bufs, dev_bufs = bufs[:len(bufs)//2], bufs[len(bufs)//2:]
-    cpu_prg = get_runner("CPU", ast.src[0])
-    cpu_prg([cpu_bufs[i].ensure_allocated() for i in cpu_prg.p.globals], {**ctx.var_vals, **device_vars}, wait=False)
-    for i in cpu_prg.p.outs: np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(), cpu_bufs[i].numpy(), rtol=1e-3, atol=1e-3)
+    bufs, dev_bufs = bufs[:len(bufs)//2], bufs[len(bufs)//2:]
+    var_vals = {**ctx.var_vals, **device_vars}
+    cpu_rt = get_runtime("CPU", prg:=to_program(ast.src[0], Device["CPU"].renderer))
+    global_size, local_size = prg.arg.launch_dims(var_vals)
+    cpu_rt(*[bufs[i].ensure_allocated()._buf for i in prg.arg.globals], global_size=global_size, local_size=local_size, vals=prg.arg.vals(var_vals))
+    for i in prg.arg.outs: np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(), bufs[i].numpy(), rtol=1e-3, atol=1e-3)
 
 def exec_encdec(ctx:ExecContext, call, ast):
   bufs = [cast(Buffer, b.buffer).ensure_allocated() for b in resolve_params(call, ctx.input_uops)]
@@ -229,6 +229,10 @@ pm_compile = PatternMatcher([
     call.replace(src=(to_program(ast, Device[call.device if isinstance(call.device, str) else call.device[0]].renderer), *call.src[1:]))),
 ])
 
+pm_optimize_local_size = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.PROGRAM, name="prg"),), name="call", allow_any_len=True), optimize_local_size),
+])
+
 pm_exec = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.BUFFER_VIEW, name="ast"),), name="call", allow_any_len=True), exec_view),
   (UPat(Ops.CALL, src=(UPat(Ops.COPY, name="ast"),), name="call", allow_any_len=True), exec_copy),
@@ -241,7 +245,8 @@ pm_exec = PatternMatcher([
 def compile_linear(linear:UOp, beam=0, validate=False) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
   if (beam_val:=(beam or BEAM.value)) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
-  return graph_rewrite(linear, pm_compile, name="precompile kernels", walk=True)
+  linear = graph_rewrite(linear, pm_compile, name="precompile kernels", walk=True)
+  return graph_rewrite(linear, pm_optimize_local_size, name="optimize local size", walk=True)
 
 def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:tuple[UOp, ...]=(), do_update_stats=True, jit=False):
   if not jit: linear = compile_linear(linear, validate=VALIDATE_WITH_CPU)

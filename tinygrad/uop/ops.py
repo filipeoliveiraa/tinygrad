@@ -100,7 +100,7 @@ class UOpMetaClass(type):
     return created
 
 # some uops map to other stuff
-buffers:weakref.WeakKeyDictionary[UOp, Buffer|MultiBuffer] = weakref.WeakKeyDictionary() # this maps BUFFER uops to their device Buffers
+buffers:weakref.WeakKeyDictionary[UOp, Buffer|MultiBuffer] = weakref.WeakKeyDictionary() # this maps BUFFER/BUFFER_VIEW uops to their device Buffers
 all_metadata:weakref.WeakKeyDictionary[UOp, tuple[Metadata, ...]] = weakref.WeakKeyDictionary() # TODO: should this be here?
 
 # recursive_property replaces functools.cached_property in recursive UOp functions to prevent RecursionError
@@ -417,8 +417,8 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
   def group(*srcs:UOp|None):  # pylint: disable=no-self-argument
     if len(srcs) == 1 and isinstance(srcs[0], UOp): return srcs[0]
     return UOp(Ops.GROUP, dtypes.void, tuple([x for x in srcs if x is not None]))
-  def vectorize(self, *srcs, **kwargs):
-    return UOp(Ops.STACK, self.dtype.vec(len(srcs)+1), (self,)+srcs, **kwargs)
+  def vectorize(self, *srcs):
+    return UOp(Ops.STACK, self.dtype.vec(len(srcs)+1), (self,)+srcs)
   def index(self, *srcs:UOp|None, ptr=False, **kwargs):
     return UOp(Ops.INDEX, kwargs.pop("dtype", self.dtype if ptr else self.dtype.base), (self,)+tuple([x for x in srcs if x is not None]), **kwargs)
   def __getitem__(self, idx):
@@ -735,13 +735,16 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       assert isinstance(buf, Buffer), "must be a Buffer for BITCAST"
       return buf.view(prod(self.max_shape), self.dtype, 0)
     if self.op is Ops.BUFFER_VIEW:
+      if (cret:=buffers.get(self)) is not None: return cret
       buf = self.src[0].buffer
       if isinstance(buf, MultiBuffer):
         mbuf = MultiBuffer.__new__(MultiBuffer)
         mbuf.bufs = [b.view(self.arg[0], self.dtype, self.arg[1] * self.dtype.itemsize) for b in buf.bufs]
+        buffers[self] = mbuf
         return mbuf
       assert isinstance(buf, Buffer), "must be a Buffer for BUFFER_VIEW"
-      return buf.view(self.arg[0], self.dtype, self.arg[1] * self.dtype.itemsize)
+      buffers[self] = bv = buf.view(self.arg[0], self.dtype, self.arg[1] * self.dtype.itemsize)
+      return bv
     if self.op is Ops.MSELECT:
       ret = self.src[0].buffer
       assert isinstance(ret, MultiBuffer)

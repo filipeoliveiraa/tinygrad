@@ -13,8 +13,8 @@ def is_cdna4(): return Device[Device.DEFAULT].renderer.target.arch.startswith("g
 def run_asm_gemm(a_shape, b_shape, dtype=dtypes.float16, a_shard=None, b_shard=None, gpus:int=1) -> None:
   Tensor.manual_seed(0)
   input_dtype = dtypes.bfloat16 if dtype == FP8_DTYPE else dtype
-  a_rand = Tensor.randn(a_shape, dtype=dtypes.float, requires_grad=False).sub(0.5).cast(input_dtype)
-  b_rand = Tensor.randn(b_shape, dtype=dtypes.float, requires_grad=False).sub(0.5).cast(input_dtype)
+  a_rand = Tensor.randn(a_shape, dtype=dtypes.float).sub(0.5).cast(input_dtype)
+  b_rand = Tensor.randn(b_shape, dtype=dtypes.float).sub(0.5).cast(input_dtype)
   with Context(DEBUG=0):
     Tensor.realize(a_rand, b_rand)
 
@@ -27,7 +27,12 @@ def run_asm_gemm(a_shape, b_shape, dtype=dtypes.float16, a_shard=None, b_shard=N
     with Context(DEBUG=0):
       Tensor.realize(a_rand, x_scale, b_rand, w_scale, grad_amax_state)
 
+  # clone all inputs before any backward: a clone copies the source's current .grad
   a, b = a_rand.clone(), b_rand.clone()
+  if dtype == FP8_DTYPE:
+    a_ref, b_ref = a_rand.detach().cast(dtypes.bfloat16), b_rand.detach().cast(dtypes.bfloat16)
+  else:
+    a_ref, b_ref = a_rand.clone(), b_rand.clone()
   if multi: a, b = a.shard(devs, axis=a_shard), b.shard(devs, axis=b_shard)
   if dtype == FP8_DTYPE:
     tst = asm_gemm(a, b, x_scale=x_scale, w_scale=w_scale, grad_amax_state=grad_amax_state)
@@ -36,10 +41,6 @@ def run_asm_gemm(a_shape, b_shape, dtype=dtypes.float16, a_shard=None, b_shard=N
   tst.sum().backward()
   Tensor.realize(tst, a.grad, b.grad)
 
-  if dtype == FP8_DTYPE:
-    a_ref, b_ref = a_rand.detach().cast(dtypes.bfloat16).requires_grad_(), b_rand.detach().cast(dtypes.bfloat16).requires_grad_()
-  else:
-    a_ref, b_ref = a_rand.clone(), b_rand.clone()
   if multi: a_ref, b_ref = a_ref.shard(devs, axis=a_shard), b_ref.shard(devs, axis=b_shard)
   if dtype == FP8_DTYPE:
     ref = ((a_ref @ b_ref) * x_scale * w_scale).cast(dtypes.bfloat16)
@@ -151,8 +152,8 @@ class TestGemmLlama(unittest.TestCase):
   def test_empty(self): asm_gemm(Tensor.empty(N:=getenv("N", 4096), N, dtype=self.dtype), Tensor.empty(N, N, dtype=self.dtype)).realize()
 
   def test_empty_bw(self):
-    x = Tensor.empty(1, N:=getenv("N", 4096), N, dtype=self.dtype, requires_grad=True)
-    y = Tensor.empty((N, N), dtype=self.dtype, requires_grad=True)
+    x = Tensor.empty(1, N:=getenv("N", 4096), N, dtype=self.dtype)
+    y = Tensor.empty((N, N), dtype=self.dtype)
     if self.dtype == FP8_DTYPE:
       x_scale = Tensor.empty((), dtype=dtypes.float32)
       w_scale = Tensor.empty((), dtype=dtypes.float32)

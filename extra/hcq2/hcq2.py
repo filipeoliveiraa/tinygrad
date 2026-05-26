@@ -291,7 +291,8 @@ def bufferize_kernargs(ctx:HCQ2LowerCtx, target:UOp, buf_node:UOp) -> UOp:
     dctx = ctx.dev_ctx[dev]
     isz = dctx.kernargs_host.dtype.base.itemsize
     off = dctx.kernargs_allocator.alloc(buf_node.arg, 16)
-    hbufs.append(UOp(Ops.BUFFER_VIEW, dctx.kernargs_host.dtype, src=(dctx.kernargs_host,), arg=(buf_node.arg // isz, off // isz)))
+    hbufs.append(UOp(Ops.BUFFER_VIEW, dctx.kernargs_host.dtype,
+                     src=(dctx.kernargs_host, UOp.const(dtypes.weakint, off)), arg=buf_node.arg // isz))
     addrs.append(dctx.kernargs_gpu + off)
   return _maybe_mstack(tuple(addrs)).after(*_lower_stores(_maybe_mstack(tuple(hbufs)), buf_node, target.src[1:]))
 
@@ -348,9 +349,6 @@ def fold_blob_store(ctx:HCQ2LowerCtx, buf:UOp, blob:UOp) -> UOp:
     b.buffer.ensure_allocated()._buf.cpu_view().mv.cast('B')[:len(blob.arg)] = blob.arg
   return UOp(Ops.NOOP)
 
-def _new_addr_table(n:int) -> UOp:
-  return _maybe_mstack(tuple(UOp.from_buffer(Buffer("CPU", 256, dtypes.uint64, preallocate=True), "CPU") for _ in range(n)))
-
 def resolve_getaddr(ctx:HCQ2LowerCtx, m:UOp) -> UOp:
   srcs = m.src if m.op is Ops.MSTACK else (m,)
   for s in srcs:
@@ -360,17 +358,15 @@ def resolve_getaddr(ctx:HCQ2LowerCtx, m:UOp) -> UOp:
   # fast-path: all per-dev VAs equal -> just a const
   if all(v == addrs[0] for v in addrs): return UOp.const(dtypes.uint64, addrs[0])
 
-  if ctx.addr_table is None: ctx.addr_table = _new_addr_table(len(srcs)) # TODO: move
-  table, slot_const = ctx.addr_table, UOp.const(dtypes.int, (slot:=ctx.next_slot))
-  ctx.next_slot = slot + 1
-
-  patch = table.index(slot_const, dtype=table.dtype.ptr()).store(_maybe_mstack(tuple(UOp.const(dtypes.uint64, va) for va in addrs)))
+  table = _maybe_mstack(tuple(UOp.from_buffer(Buffer("CPU", 1, dtypes.uint64, preallocate=True), "CPU") for _ in range(len(srcs))))
+  vas = _maybe_mstack(tuple(UOp.const(dtypes.uint64, va) for va in addrs))
+  patch = table.index(slot_const:=UOp.const(dtypes.int, 0), dtype=table.dtype.ptr()).store(vas)
   return table.after(patch).index(slot_const, dtype=table.dtype.ptr()).load(dtype=dtypes.uint64)
 
 pm_resolve_patches = symbolic + PatternMatcher([
   # resolve getaddrs
   (UPat(Ops.GETADDR, src=(UPat(Ops.BUFFER_VIEW, name="bv"),)), # getaddr(buffer_view(x)) -> offset+getaddr(x)
-    lambda ctx, bv: UOp(Ops.GETADDR, dtypes.uint64, src=(bv.src[0],)) + UOp.const(dtypes.uint64, bv.arg[1] * bv.dtype.itemsize)),
+    lambda ctx, bv: UOp(Ops.GETADDR, dtypes.uint64, src=(bv.src[0],)) + UOp.const(dtypes.uint64, bv.src[1].arg)),
   (UPat(Ops.GETADDR, src=(UPat((Ops.BUFFER, Ops.MSTACK), name="m"),)), resolve_getaddr), # getaddr(buffer|mstack) -> addr_table load|const
   (UPat(Ops.GETADDR, src=(UPat.cvar("const"),)), lambda ctx, const: const), # getaddr(const) -> const
 
@@ -391,7 +387,7 @@ def parametrize_host_buffer(ctx:HCQ2LowerCtx, buf:UOp) -> UOp:
 pm_parametrize_host_buffers = PatternMatcher([
   # resolve buffer views to parametrize only root buffers
   (UPat(Ops.INDEX, src=(UPat(Ops.BUFFER_VIEW, name="bv"), UPat.var("idx")), name="bi"),
-    lambda bv, idx, bi: bi.replace(src=(bv.src[0], idx + bv.arg[1]))),
+    lambda bv, idx, bi: bi.replace(src=(bv.src[0], idx + bv.src[1].arg // bv.src[0].dtype.itemsize))),
 
   # parametrize host buffers
   (UPat(Ops.AFTER, src=(UPat((Ops.BUFFER, Ops.BUFFER_VIEW, Ops.MSTACK)),), allow_any_len=True, name="buf"), parametrize_host_buffer),

@@ -491,6 +491,9 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       perm = src.permute(tuple([i for i in range(src.ndim) if i not in slice_idx] + slice_idx))
       return perm.index(*non_slice_args, ptr=True)
     return self.index(*[UOp.const(dtypes.weakint, x) if isinstance(x, int) else x for x in idx])
+  @property
+  def _uop(self) -> UOp: return self
+  def _wrap_uop(self, u:UOp) -> UOp: return u
   def const_like(self, b:ConstLike, dtype:DType|None=None):
     return UOp.const(dtype or self.dtype.base, b, shape=self._shape)
   def ufix(self, x):
@@ -687,14 +690,14 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
       case _: raise RuntimeError(f"no sgep on {self.op}")
 
   @functools.cached_property
+  def as_shape(self) -> tuple[sint, ...]:
+    return tuple(ssimplify(self.sgep(i)) for i in range(max(self.dtype.count, len(self.src))))
+
+  @functools.cached_property
   def marg(self):
     match self.op:
-      case Ops.RESHAPE | Ops.EXPAND: return tuple(ssimplify(self.src[1].sgep(i)) for i in range(self.src[1].dtype.count))
-      case Ops.PAD | Ops.SHRINK:
-        # this is like broadcasting for shapes
-        return tuple(((ssimplify(self.src[1]) if self.src[1].shape == () else self.src[1].sgep(i)),
-                      (ssimplify(self.src[2]) if self.src[2].shape == () else self.src[2].sgep(i)))
-                     for i in range(max(self.src[1].dtype.count, self.src[2].dtype.count)))
+      case Ops.RESHAPE | Ops.EXPAND: return self.src[1].as_shape
+      case Ops.PAD | Ops.SHRINK: return tuple(zip(self.src[1].as_shape, self.src[2].as_shape))
       case Ops.PERMUTE | Ops.FLIP: return self.arg
       case _: raise RuntimeError(f"{self.op} is not a MovementOp")
 

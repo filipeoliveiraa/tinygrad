@@ -136,24 +136,13 @@ class Tensor(RandMixin):
     all_tensors[weakref.ref(ret)] = None
     return ret
 
-  # alu and const_like are used by the mixins
+  # alu, _uop, _wrap_uop and const are used by the mixins
   def alu(self, op: Ops, *src: Tensor) -> Tensor: return self._apply_uop(lambda *u: u[0].alu(op, *u[1:]), *src)
   @property
   def _uop(self) -> UOp: return self.uop
   def _wrap_uop(self, u:UOp) -> Tensor: return Tensor(u)
-  def const_like(self, b:ConstType) -> Tensor: return Tensor(self.uop.const_like(b))
   @staticmethod
   def const(dtype:DType, b:ConstType|UOp) -> Tensor: return Tensor(UOp.const(dtype, b))
-  @staticmethod
-  def invalids(*shape, device:str|tuple[str, ...]|None=None, dtype:DTypeLike|None=None) -> Tensor:
-    """
-    Creates a tensor with the given shape, filled with Invalid.
-
-    This is an alternative to Tensor.empty when you want an "anonymous" buffer.
-
-    Eventually Tensor.empty will be replaced by this.
-    """
-    return Tensor(UOp.invalids(argfix(*shape), dtype, device))
 
   def is_param_(self, is_param:bool=True) -> Tensor:
     self.is_param = is_param
@@ -463,13 +452,6 @@ class Tensor(RandMixin):
     ```
     """
     return Tensor(UOp.empty(argfix(*shape), dtype, device))
-
-  def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> Tensor:
-    """
-    Creates an empty tensor with the same shape as `self`.
-    If `dtype` is not specified, the dtype of `self` is used.
-    """
-    return Tensor(self.uop.empty_like(dtype, device))
 
   @staticmethod
   def from_blob(ptr:int, shape:tuple[int, ...], **kwargs) -> Tensor:
@@ -816,46 +798,6 @@ class Tensor(RandMixin):
 
   def _mop(self, op:Ops, arg) -> Tensor: return self._apply_uop(UOp._mop, extra_args=(op,), arg=arg)
   def _rop(self, op:Ops, axis:tuple[int, ...]) -> Tensor: return self._apply_uop(UOp._rop, op=op, axis=axis)
-
-  def __getitem__(self, indices) -> Tensor:
-    """
-    Retrieves a sub-tensor using indexing.
-
-    Supported Index Types: `int | slice | Tensor | None | list | tuple | Ellipsis`
-
-    Examples:
-    ```python exec="true" source="above" session="tensor" result="python"
-    t = Tensor.arange(12).reshape(3, 4)
-    print(t.numpy())
-    ```
-
-    - Int Indexing: Select an element or sub-tensor using integers for each dimension.
-      ```python exec="true" source="above" session="tensor" result="python"
-      print(t[1, 2].numpy())
-      ```
-
-    - Slice Indexing: Select a range of elements using slice notation (`start:end:stride`).
-      ```python exec="true" source="above" session="tensor" result="python"
-      print(t[0:2, ::2].numpy())
-      ```
-
-    - Tensor Indexing: Use another tensor as indices for advanced indexing. Using `tuple` or `list` here also works.
-      ```python exec="true" source="above" session="tensor" result="python"
-      print(t[Tensor([2, 0, 1]), Tensor([1, 2, 3])].numpy())
-      ```
-
-    - `None` Indexing: Add a new dimension to the tensor.
-      ```python exec="true" source="above" session="tensor" result="python"
-      print(t[:, None].shape)
-      ```
-
-    NOTE: Out-of-bounds indexing results in a value of `0`.
-    ```python exec="true" source="above" session="tensor" result="python"
-    t = Tensor([1, 2, 3])
-    print(t[Tensor([4, 3, 2])].numpy())
-    ```
-    """
-    return super().__getitem__(indices)
 
   def __setitem__(self, indices, v:Tensor|PyConst|list|tuple) -> None:
     if isinstance(v, Tensor) and v.dtype != self.dtype: raise RuntimeError(f"setitem dtype mismatch: {self.dtype=} != {v.dtype=}")

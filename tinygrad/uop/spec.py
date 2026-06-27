@@ -156,7 +156,7 @@ spec_tensor = PatternMatcher([
    and isinstance(x.arg[1], tuple) and all(y.dtype in (dtypes.weakint, dtypes.int) for y in x.src[1:])),
 
   # COPY. TODO: this should not have allow_any_len, but something is adding ranges
-  (UPat(Ops.COPY, name="copy", src=(UPat.var("x"), UPat(Ops.DEVICE)), allow_any_len=True, arg=None), lambda copy,x: copy.dtype == x.dtype),
+  (UPat(Ops.COPY, name="copy", src=(UPat.var("x"),), allow_any_len=True), lambda copy,x: copy.dtype == x.dtype and is_device(copy.arg)),
   (UPat(Ops.ALLREDUCE, name="red", src=(UPat.var("x"),)), lambda red,x: red.dtype == x.dtype and isinstance(red.arg, tuple) and
    len(red.arg) == 2 and red.arg[0] in GroupOp.Reduce and is_device(red.arg[1])),
 
@@ -230,7 +230,7 @@ spec_full = PatternMatcher([
   # allow any AFTER
   (UPat(Ops.AFTER, src=(UPat(),), allow_any_len=True), lambda: True),
 
-  # expander: unroll/contract/gep/ptrcat/cat
+  # expander: unroll/contract/gep/cat
   (UPat((Ops.UNROLL, Ops.CONTRACT), src=(UPat(),)), lambda: True),
 
   # GEP multi is supported here
@@ -241,13 +241,6 @@ spec_full = PatternMatcher([
 
   # while BIND is being casted
   (UPat(Ops.BIND, (dtypes.int, dtypes.weakint), (UPat(), UPat()), arg=None), lambda: True),
-
-  # TODO: PTRCAT and VCAT need to be deleted
-
-  # PTRCAT is like VECTORIZE, but it functions on ptrs
-  (UPat(Ops.PTRCAT, name="x"), lambda x: x.dtype.vcount == sum([y.dtype.base.count for y in x.src])),
-  # VCAT is like VECTORIZE, but the srcs can be vectors
-  (UPat(Ops.VCAT, name="x"), lambda x: x.dtype.vcount == sum([y.dtype.vcount for y in x.src])),
 ])+spec_tensor+spec_program
 
 # **** pyrender (move this) ****

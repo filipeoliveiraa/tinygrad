@@ -90,10 +90,7 @@ class Ops(FastEnum):
   # ** 6 -- ops that don't exist in programs **
 
   # tensor graph ops
-  UNIQUE = auto(); DEVICE = auto()
-
-  # local unique
-  LUNIQUE = auto()
+  DEVICE = auto()
 
   # ops that adjust the behavior of the scheduler
   CONTIGUOUS = auto(); CONTIGUOUS_BACKWARD = auto(); DETACH = auto()
@@ -109,7 +106,7 @@ class Ops(FastEnum):
   REDUCE = auto(); ALLREDUCE = auto()
 
   # expander ops
-  UNROLL = auto(); CONTRACT = auto(); VCAT = auto(); PTRCAT = auto()
+  UNROLL = auto(); CONTRACT = auto()
 
 class GroupOp:
   Unary = {Ops.EXP2, Ops.LOG2, Ops.SIN, Ops.SQRT, Ops.RECIPROCAL, Ops.NEG, Ops.TRUNC}

@@ -8,7 +8,7 @@ def reduce_gradient(ctx:UOp, ret:UOp, op:Ops):
   def broadcast_to_input(x):
     shape, j = [], 0
     for i in range(len(ret.src[0].shape)):
-      if i in ret.arg[1]: shape.append(1)
+      if i < ret.arg[1]: shape.append(1)
       else:
         shape.append(x.shape[j])
         j += 1
@@ -17,7 +17,7 @@ def reduce_gradient(ctx:UOp, ret:UOp, op:Ops):
   if op == Ops.MAX:
     assert ret.op is Ops.REDUCE, "only works on REDUCE"
     mask = ret.src[0].eq(broadcast_to_input(ret)).cast(ctx.dtype)
-    count = mask._rop(Ops.ADD, ret.arg[1])
+    count = mask._rop(Ops.ADD, tuple(range(ret.arg[1])))
     return ((mask/broadcast_to_input(count)) * broadcast_to_input(ctx),)
   if op == Ops.MUL: return (broadcast_to_input(ctx * ret) / ret.src[0],)
 
@@ -75,7 +75,7 @@ pm_gradient = PatternMatcher([
   (UPat(Ops.CONTIGUOUS_BACKWARD), lambda ctx: (ctx.contiguous(),)),
   (UPat(Ops.RESHAPE, name="ret"), lambda ctx, ret: (ctx.reshape(ret.src[0].shape), None)),
   (UPat(Ops.EXPAND, name="ret"), lambda ctx, ret:
-    (ctx.cast(sum_acc_dtype(ctx.dtype))._rop(Ops.ADD, tuple(i for i,(s,n) in enumerate(zip(ret.src[0].shape, ret.shape)) if s!=n))
+    (ctx.cast(sum_acc_dtype(ctx.dtype))._rop(Ops.ADD, tuple(range(len(ret.marg))))
      .reshape(ret.src[0].shape).cast(ctx.dtype), None)),
   (UPat(Ops.PAD, name="ret"), lambda ctx, ret: (ctx.shrink(tuple([(p[0], s+p[0]) for s,p in zip(ret.src[0].shape, ret.marg)])), None, None)),
   (UPat(Ops.SHRINK, name="ret"), lambda ctx, ret: (ctx.pad(tuple([(p[0], s-p[0]-p[1]) for s,p in zip(ret.src[0].shape, ret.marg)])), None, None)),

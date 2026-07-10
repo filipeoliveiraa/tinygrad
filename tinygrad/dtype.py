@@ -97,10 +97,10 @@ class DType(metaclass=DTypeMetaClass):
 class dtypes:
   @staticmethod
   @functools.cache
-  def is_float(x: DType) -> bool: return x.scalar() in dtypes.floats
+  def is_float(x: DType) -> bool: return x.scalar() in (dtypes.floats + (dtypes.weakfloat,))
   @staticmethod # static methods on top, or bool in the type info will refer to dtypes.bool
   @functools.cache
-  def is_int(x: DType) -> bool: return x.scalar() in (dtypes.ints + (dtypes.weakint,))
+  def is_int(x: DType) -> bool: return x.scalar() in (dtypes.ints + (dtypes.weakint, dtypes.index))
   @staticmethod
   @functools.cache
   def is_unsigned(x: DType) -> bool: return x.scalar() in dtypes.uints
@@ -123,6 +123,7 @@ class dtypes:
             dtypes.fp8e4m3: (4, 3), dtypes.fp8e5m2: (5, 2), dtypes.fp8e4m3fnuz: (4, 3), dtypes.fp8e5m2fnuz: (5, 2)}[dtype]
   void: Final[DType] = DType.new(-1, 0, "void", None)
   weakint: Final[DType] = DType.new(0, 800, "weakint", None)
+  index: Final[DType] = DType.new(0, 800, "index", None)  # NOTE: not in the promo lattice: index math never mixes dtypes
   bool: Final[DType] = DType.new(0, 1, "bool", '?')
   int8: Final[DType] = DType.new(1, 8, "signed char", 'b')
   uint8: Final[DType] = DType.new(2, 8, "unsigned char", 'B')
@@ -134,15 +135,16 @@ class dtypes:
   uint64: Final[DType] = DType.new(8, 64, "unsigned long", 'Q')
   _uint128: Final[DType] = DType.new(8, 128, "uint128", None)
   _uint256: Final[DType] = DType.new(8, 256, "uint256", None)
-  fp8e4m3: Final[DType] = DType.new(9, 8, "float8_e4m3", None)
-  fp8e5m2: Final[DType] = DType.new(10, 8, "float8_e5m2", None)
-  fp8e4m3fnuz: Final[DType] = DType.new(9, 8, "float8_e4m3fnuz", None)
-  fp8e5m2fnuz: Final[DType] = DType.new(10, 8, "float8_e5m2fnuz", None)
-  float16: Final[DType] = DType.new(11, 16, "half", 'e')
+  weakfloat: Final[DType] = DType.new(9, 800, "weakfloat", None)
+  fp8e4m3: Final[DType] = DType.new(10, 8, "float8_e4m3", None)
+  fp8e5m2: Final[DType] = DType.new(11, 8, "float8_e5m2", None)
+  fp8e4m3fnuz: Final[DType] = DType.new(10, 8, "float8_e4m3fnuz", None)
+  fp8e5m2fnuz: Final[DType] = DType.new(11, 8, "float8_e5m2fnuz", None)
+  float16: Final[DType] = DType.new(12, 16, "half", 'e')
   # bfloat16 has higher priority than float16, so least_upper_dtype(dtypes.int64, dtypes.uint64) = dtypes.float16
-  bfloat16: Final[DType] = DType.new(12, 16, "__bf16", None)
-  float32: Final[DType] = DType.new(13, 32, "float", 'f')
-  float64: Final[DType] = DType.new(14, 64, "double", 'd')
+  bfloat16: Final[DType] = DType.new(13, 16, "__bf16", None)
+  float32: Final[DType] = DType.new(14, 32, "float", 'f')
+  float64: Final[DType] = DType.new(15, 64, "double", 'd')
 
   # dtype aliases
   half = float16; float = float32; double = float64 # noqa: E702
@@ -163,7 +165,7 @@ class dtypes:
   uints = (uint8, uint16, uint32, uint64)
   sints = (int8, int16, int32, int64)
   ints = uints + sints
-  all = floats + ints + (bool, weakint) # noqa: A003
+  all = floats + ints + (bool,) # noqa: A003
 
 if (env_default_float := getenv("DEFAULT_FLOAT", "")):
   dtypes.default_float = getattr(dtypes, env_default_float.lower())
@@ -177,7 +179,8 @@ def to_dtype(dtype:DTypeLike) -> DType: return dtype if isinstance(dtype, DType)
 promo_lattice = { dtypes.bool: [dtypes.weakint], dtypes.weakint: [dtypes.int8, dtypes.uint8],
   dtypes.int8: [dtypes.int16], dtypes.int16: [dtypes.int32], dtypes.int32: [dtypes.int64],
   dtypes.int64: [dtypes.uint64], dtypes.uint8: [dtypes.int16, dtypes.uint16], dtypes.uint16: [dtypes.int32, dtypes.uint32],
-  dtypes.uint32: [dtypes.int64, dtypes.uint64], dtypes.uint64: [dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz],
+  dtypes.uint32: [dtypes.int64, dtypes.uint64], dtypes.uint64: [dtypes.weakfloat],
+  dtypes.weakfloat: [dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz],
   dtypes.fp8e4m3: [dtypes.float16, dtypes.bfloat16], dtypes.fp8e5m2: [dtypes.float16, dtypes.bfloat16],
   dtypes.fp8e4m3fnuz: [dtypes.float16, dtypes.bfloat16], dtypes.fp8e5m2fnuz: [dtypes.float16, dtypes.bfloat16],
   dtypes.float16: [dtypes.float32], dtypes.bfloat16: [dtypes.float32], dtypes.float32: [dtypes.float64], }
@@ -190,8 +193,8 @@ def least_upper_dtype(*ds:DType) -> DType:
   return min(set.intersection(*[_get_recursive_parents(d.scalar()) for d in ds]))
 def least_upper_float(dt:DType) -> DType: return dt if dtypes.is_float(dt) else least_upper_dtype(dt, dtypes.default_float)
 
-DTYPES_DICT = {k: v for k, v in dtypes.__dict__.items() if isinstance(v, DType) and not k.startswith(("default", "void", "weakint", "_"))}
-INVERSE_DTYPES_DICT = {**{v.name:k for k,v in DTYPES_DICT.items()}, "void": "void", "weakint":"weakint"}
+DTYPES_DICT = {k: v for k, v in dtypes.__dict__.items() if isinstance(v, DType) and not k.startswith(("default", "void", "weak", "index", "_"))}
+INVERSE_DTYPES_DICT = {**{v.name:k for k,v in DTYPES_DICT.items()}, "void": "void", "weakint":"weakint", "index":"index", "weakfloat":"weakfloat"}
 
 @functools.cache
 def can_lossless_cast(dt0:DType, dt1:DType) -> bool:
@@ -199,7 +202,7 @@ def can_lossless_cast(dt0:DType, dt1:DType) -> bool:
   # similar to https://numpy.org/doc/stable/reference/generated/numpy.can_cast.html
   if dt0 == dt1 or dt0 == dtypes.bool: return True
   match dt1:
-    case dtypes.weakint: return dt0 in dtypes.ints
+    case dtypes.weakint | dtypes.index: return dt0 in dtypes.ints
     case dtypes.double: return dt0 in (dtypes.float, dtypes.half, dtypes.bfloat16, *dtypes.fp8s,
       dtypes.uint32, dtypes.uint16, dtypes.uint8, dtypes.int32, dtypes.int16, dtypes.int8)
     case dtypes.float: return dt0 in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s, dtypes.uint16, dtypes.uint8, dtypes.int16, dtypes.int8)

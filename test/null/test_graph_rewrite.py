@@ -107,28 +107,28 @@ class TestFoldingAndReduction(unittest.TestCase):
 class TestModuloAndDivisionFolding(unittest.TestCase):
   def test_full_graph_rewrite_modulo_folding_with_define_var(self):
     # index dtype because div-mod rules only work on index
-    x_var_uop = UOp.variable('x', 0, 100).cast(dtypes.weakint)
+    x_var_uop = UOp.variable('x', 0, 100).cast(dtypes.index)
     optimized_mod_uop = apply_rewrite(((x_var_uop * 4) + 2) % 4)
     self.assertEqual(optimized_mod_uop.op, Ops.CONST)
     self.assertEqual(optimized_mod_uop.arg, 2)
 
   def test_full_graph_rewrite_division_folding_with_define_var(self):
     # index dtype because div-mod rules only work on index
-    n_var_uop = UOp.variable('n', 1, 1000).cast(dtypes.weakint)
+    n_var_uop = UOp.variable('n', 1, 1000).cast(dtypes.index)
     optimized_div_uop = apply_rewrite((n_var_uop * 6) // 3)
     self.assertEqual(optimized_div_uop.op, Ops.MUL)
     self.assertEqual(optimized_div_uop.src[1].arg, 2)
 
   def test_full_graph_rewrite_complex_mod_div_folding(self):
     # index dtype because div-mod rules only work on index
-    k_var_uop = UOp.variable('k', 0, 50).cast(dtypes.weakint)
+    k_var_uop = UOp.variable('k', 0, 50).cast(dtypes.index)
     optimized_div_uop = apply_rewrite(((k_var_uop * 12 + 8) % 6) // 2)
     self.assertEqual(optimized_div_uop.op, Ops.CONST)
     self.assertEqual(optimized_div_uop.arg, 1)
 
   def test_graph_rewrite_div_folding_bug(self):
-    lhs = UOp(Ops.ADD, dtypes.int.vec(4), src=(
-      UOp(Ops.STACK, dtypes.int.vec(4), arg=None, src=(UOp(Ops.SPECIAL, dtypes.int, arg='lidx0', src=(UOp.const(dtypes.int, 32),)),)*4),
+    lhs = UOp(Ops.ADD, src=(
+      UOp(Ops.STACK, arg=None, src=(UOp(Ops.SPECIAL, src=(UOp.const(dtypes.int, 32),), arg='lidx0'),)*4),
       UOp.const(dtypes.int, (0, 256, 512, 768))))
     rhs = UOp.const(dtypes.int, (2,)*4)
     unopt = lhs<rhs
@@ -140,7 +140,7 @@ class TestModuloAndDivisionFolding(unittest.TestCase):
   def test_full_graph_rewrite_modulo_large_divisor(self):
     # index dtype because div-mod rules only work on index
     x_var_uop = UOp.variable('x', 1, 5)
-    self.assertIs(apply_rewrite(x_var_uop.cast(dtypes.weakint) % 10).render(simplify=False), x_var_uop.render(simplify=False))
+    self.assertIs(apply_rewrite(x_var_uop.cast(dtypes.index) % 10).render(simplify=False), x_var_uop.render(simplify=False))
 
   def test_full_graph_rewrite_division_with_remainder(self):
     x_var_uop = UOp.variable('x', 7, 9)
@@ -203,7 +203,7 @@ class TestGEPAndVectorizeRewrite(unittest.TestCase):
   def test_vectorize_multiple_elements(self):
     # Vectorizing multiple elements using GEP
     base_vector = UOp.const(dtypes.float32, (5.0, 10.0, 15.0, 20.0))
-    vectorized_uop = UOp(Ops.STACK, dtypes.float32, src=tuple(base_vector.index(i) for i in range(4)))
+    vectorized_uop = UOp(Ops.STACK, src=tuple(base_vector.index(i) for i in range(4)))
     self.assertEqual(list(apply_rewrite_values(vectorized_uop)), [5.0, 10.0, 15.0, 20.0])
 
 

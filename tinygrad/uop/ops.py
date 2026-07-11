@@ -65,11 +65,14 @@ def _align_left(*shapes:tuple[sint, ...]) -> tuple[tuple[sint, ...], ...]:
   max_dim = max(len(s) for s in shapes)
   return tuple((1,)*(max_dim-len(s))+s for s in shapes)
 def _broadcast_shape(*shapes:tuple[sint, ...]) -> tuple[sint, ...]:
-  shaped_aligned_left = _align_left(*shapes)
-  ret = tuple(0 if 0 in nth_dim_sizes else smax(nth_dim_sizes) for nth_dim_sizes in zip(*shaped_aligned_left))
-  if not all(resolve(s == ns) or resolve(s == 1) for shape in shaped_aligned_left for s,ns in zip(shape, ret)):
-    raise IndexError(f"shape mismatch: objects cannot be broadcast to a single shape {shapes}")
-  return ret
+  if all_same(shapes): return shapes[0]
+  # per right-aligned dim: sizes of 1 broadcast to the others, which must all agree
+  ret = []
+  for sizes in zip(*_align_left(*shapes)):
+    if len(rest:=dedup([s for s in sizes if isinstance(s, UOp) or s != 1])) > 1:
+      raise IndexError(f"shape mismatch: objects cannot be broadcast to a single shape {shapes}")
+    ret.append(rest[0] if rest else 1)
+  return tuple(ret)
 
 def ssimplify(uop:sint): return uop.ssimplify() if isinstance(uop, UOp) else uop
 def sym_infer(uop: UOp|int, var_vals: dict[str, int]) -> int: return uop.sym_infer(var_vals) if isinstance(uop, UOp) else uop
@@ -155,7 +158,6 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType|None:
   # NOTE: CMPLT, CMPNE, CMPEQ, WHERE, SHL, SHR are handled above
   if op in GroupOp.Broadcastable:
     # TODO: support dtype broadcasting (promotion)
-    if len(src) == 0: return dtypes.void
     if not all_same([x.dtype for x in src]): raise RuntimeError(f"dtype mismatch in {op}")
     return src[0].dtype
   if op in GroupOp.Movement: return src[0].dtype
@@ -1152,7 +1154,9 @@ class ProgramInfo:
     local_size = tuple([sym_infer(sz, var_vals) for sz in self.local_size]) if self.local_size is not None else None
     return global_size, local_size
 
-  def vals(self, var_vals:dict[str, int]): return tuple(var_vals[k.expr] if k.expr not in self.runtimevars else None for k in self.vars)
+  def vals(self, var_vals:dict[str, int]) -> tuple[int|None, ...]:
+    try: return tuple(var_vals[k.expr] if k.expr not in self.runtimevars else None for k in self.vars)
+    except KeyError as e: raise RuntimeError(f"unbound Variable {e} used by {self.function_name}") from None
 
   @staticmethod
   def from_sink(sink:UOp, aux:tuple=()) -> ProgramInfo:
@@ -1216,7 +1220,8 @@ def exec_alu(op:Ops, dtype:DType, operands, truncate_output=True):
     return tuple([exec_alu(op, dtype, [x[i] if isinstance(x, tuple) else x for x in operands]) for i in range(count)])
   if dtype==dtypes.index and op in GroupOp.Binary and Invalid in operands: return Invalid
   alu = python_alu[op](*operands)
-  return truncate.get(dtype, lambda x: x)(alu) if truncate_output else alu
+  if truncate_output and (truncate_fxn:=truncate.get(dtype)) is not None: return truncate_fxn(alu)
+  return alu
 
 def bitcast(x, in_dtype:DType, out_dtype:DType):
   assert in_dtype.itemsize == out_dtype.itemsize, "bitcast itemsize mismatch"

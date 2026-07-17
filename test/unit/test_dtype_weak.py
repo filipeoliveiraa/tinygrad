@@ -8,6 +8,32 @@ from tinygrad.uop.spec import spec_tensor
 
 
 class TestWeakPromotion(unittest.TestCase):
+  def test_rand_requires_concrete(self):
+    with self.assertRaises(ValueError): Tensor.rand(2, dtype=dtypes.weakfloat)
+    with self.assertRaises(ValueError): Tensor.const(dtypes.weakfloat, 1.0).rand_like()
+    with self.assertRaises(ValueError): Tensor.const(dtypes.weakfloat, 1.0).randn_like()
+
+  def test_sum_stays_weak(self):
+    for weak, value in ((dtypes.weakint, 1), (dtypes.weakfloat, 1.0)):
+      self.assertEqual(Tensor.const(weak, value).expand(3).sum().dtype, weak)
+    self.assertEqual((Tensor.const(dtypes.weakfloat, 1.0).expand(3).sum() + Tensor([1], dtype=dtypes.float16)).dtype, dtypes.float16)
+
+  def test_storage_width(self):
+    t = Tensor.const(dtypes.weakint, 2)
+    for fn in (lambda: t.bitcast(dtypes.int32), lambda: Tensor.const(dtypes.int32, 2).bitcast(dtypes.weakint), t.element_size, t.nbytes):
+      with self.assertRaises(RuntimeError): fn()
+
+  def test_materialize_at_default_dtype(self):
+    for weak, value, strong in ((dtypes.weakint, 3, dtypes.default_int), (dtypes.weakfloat, 0.5, dtypes.default_float)):
+      t = Tensor.const(weak, value)
+      self.assertEqual(t.dtype, weak)
+      self.assertEqual(t.data().itemsize, strong.itemsize)
+      self.assertEqual(t.numpy().dtype.itemsize, strong.itemsize)
+      realized = t.clone("CPU").realize()
+      self.assertEqual((realized.dtype, realized.uop.buffer.dtype), (strong, strong))
+    with patch.object(dtypes, "default_int", dtypes.int64):
+      self.assertEqual(Tensor.const(dtypes.weakint, 3).numpy().dtype.itemsize, dtypes.int64.itemsize)
+
   def test_uop_scalar_const_unchanged(self):
     for dtype, value in ((dtypes.index, 1), (dtypes.int32, 1), (dtypes.float32, 0.5)):
       out = UOp.variable("x", 0.0 if dtype == dtypes.float32 else 0, 10.0 if dtype == dtypes.float32 else 10, dtype) + value

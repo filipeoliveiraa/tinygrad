@@ -74,12 +74,15 @@ spec_shared = PatternMatcher([
   # CAST
   (UPat((Ops.BITCAST, Ops.CAST), src=(UPat(),), name="x"), lambda x: isinstance(x.arg, DType)),
 
-  # RANGE can be in the big graph now
+  # RANGE can be in the big graph now. a void RANGE is a bound-less loop header, the arg is an axis id like RANGE
   (UPat(Ops.RANGE, src=(UPat.var("x"),), allow_any_len=True, name="rng"), lambda rng,x:
     rng.dtype == x.dtype and isinstance(rng.arg, tuple) and len(rng.arg) >= 2 and \
       all(isinstance(ra, int) for ra in rng.arg[0:-1]) and isinstance(rng.arg[-1], AxisType)),
   (UPat(Ops.INDEX, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(dtypes.is_int(y.dtype) for y in x.src[1:]) or None),
-  (UPat(Ops.END, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(u.op is Ops.RANGE for u in x.src[1:])),
+  # END closes RANGEs
+  (UPat(Ops.END, src=(UPat(),), allow_any_len=True, name="x"), lambda x: all(u.op is Ops.RANGE for u in x.src[1:]) or None),
+  # a loop-ended END requires a trailing bool condition for the backedge (loop again while true)
+  (UPat(Ops.END, src=(UPat(), UPat(Ops.RANGE, dtypes.void), UPat(dtype=dtypes.bool))), lambda: True),
 
   # PARAM
   (UPat(Ops.PARAM, name="x"), lambda x: isinstance(x.arg, ParamArg)),
@@ -97,14 +100,15 @@ spec_shared = PatternMatcher([
   # CUSTOM (inline and non inline)
   (UPat((Ops.CUSTOMI, Ops.CUSTOM)), lambda: True),
 
+  # CALL of an external function
+  (UPat(Ops.CALL, src=(UPat(),), allow_any_len=True, name="x"),
+   lambda x: x.src[0].dtype is dtypes.uint64 if x.src[0].dtype is not dtypes.void else None),
+
   # pattern compiler IR ops (not in tensor/program graphs, but spec-compliant)
   (UPat(Ops.PYLITERAL), lambda: True),
 
   # BARRIER (on any length). TODO: this should only be in spec_program
   (UPat(Ops.BARRIER, dtypes.void), lambda: True),
-
-  # WAIT until a condition evaluates to true.
-  (UPat(Ops.WAIT, dtypes.void, src=(UPat(dtype=dtypes.bool),)), lambda: True),
 
   # assembly instruction
   (UPat(Ops.INS), lambda: True),

@@ -71,6 +71,33 @@ class TestTorchBackend(unittest.TestCase):
     a = a.as_strided((1,1,5,5), (50,50,7,1), storage_offset=21)
     np.testing.assert_equal(a.cpu().numpy().sum(-1), [[[115,150,185,220,255]]])
 
+  def test_storage_offset_of_computed_tensor(self):
+    # a computed result owns its storage, so a slice anywhere in its history must not shift the offset
+    a = torch.arange(8., device=device)
+    self.assertEqual((a[3:]+1).storage_offset(), 0)
+
+  def test_storage_offset_through_aliases(self):
+    a = torch.arange(8., device=device)[3:]
+    self.assertEqual(a.detach().storage_offset(), 3)
+    self.assertEqual(a.view(torch.int32).storage_offset(), 3)
+    torch.add(torch.ones(5, device=device), torch.ones(5, device=device), out=a)
+    self.assertEqual(a.detach().storage_offset(), 3)
+
+  @unittest.expectedFailure  # TODO: storage offset assumes a contiguous source, use UOp.contiguous_view_offset
+  def test_storage_offset_non_contiguous_source(self):
+    a = torch.arange(12., device=device).reshape(3,4)
+    self.assertEqual(a.permute(1,0)[1:].storage_offset(), 1)
+    self.assertEqual(a.flatten()[3:].flip(0).storage_offset(), 0)
+
+  def test_as_strided_explicit_zero_offset(self):
+    # storage_offset=0 is a real offset, not "unspecified": it must not fall back to the input's own offset
+    a = torch.arange(6., device=device)
+    np.testing.assert_equal(a[3:].as_strided((2,), (1,), 0).cpu().numpy(), [0,1])
+    np.testing.assert_equal(a[3:].as_strided((2,), (1,)).cpu().numpy(), [3,4])
+
+  def test_empty_strided_default_dtype(self):
+    self.assertEqual(torch.empty_strided((2,3), (1,2), device=device).dtype, torch.get_default_dtype())
+
   def test_plus_inplace(self):
     a = torch.ones(4, device=device)
     b = torch.ones(4, device=device)

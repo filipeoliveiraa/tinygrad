@@ -6,11 +6,11 @@ from enum import Enum, auto
 from tinygrad.uop import Ops, GroupOp
 from tinygrad.dtype import ConstType, dtypes, DType, DTypeLike, truncate, least_upper_dtype, least_upper_float, Invalid, AddrSpace
 from tinygrad.dtype import ConstFloat, PyConst, InvalidType, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
-from tinygrad.device import Buffer, MultiBuffer, canonicalize_device
+from tinygrad.device import Buffer, MultiBuffer, canonicalize_device, TinyELF
 from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Context, partition, temp, unwrap, T, argfix, Metadata, flatten, TRACEMETA
 from tinygrad.helpers import PROFILE, dedup, cdiv, cmod, floordiv, floormod, diskcache_put, to_function_name, cpu_profile, TracingKey
 from tinygrad.helpers import VIZ, SPEC, CAPTURE_PROCESS_REPLAY, DISALLOW_BROADCAST, get_shape, fully_flatten, to_tuple
-from tinygrad.helpers import colored, ansilen, printable
+from tinygrad.helpers import colored, ansilen, printable, Target
 if TYPE_CHECKING:
   from tinygrad.renderer import Estimates
 
@@ -45,7 +45,7 @@ axis_to_pos = {AxisType.LOOP: -1, AxisType.THREAD: 0, AxisType.GLOBAL: 0, AxisTy
                AxisType.GROUP_REDUCE: 2, AxisType.REDUCE: 4, AxisType.UNROLL: 5}
 
 range_start = {Ops.STAGE: 1, Ops.REDUCE: 1, Ops.WMMA: 3, Ops.END: 1, Ops.CALL: 1, Ops.FUNCTION: 1,
-               Ops.COPY: 1, Ops.SLICE: 2, Ops.LINEAR: 0}
+               Ops.SLICE: 2, Ops.LINEAR: 0}
 
 # https://en.wikipedia.org/wiki/Identity_element
 def identity_element(op:Ops, dt:DType) -> PyConst: return dt.const({Ops.ADD:0, Ops.MUL:1, Ops.MAX:dt.min}[op])
@@ -169,7 +169,7 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType|None:
       return arg
     case Ops.CONST:
       # derived from the value. order matters: bool is an int subclass, ConstFloat is a float subclass
-      if isinstance(arg, InvalidType): return dtypes.bool  # Invalid is the lattice bottom, typed by its consumer
+      if isinstance(arg, InvalidType): return dtypes.bool  # Invalid is always bool, the promo lattice bottom
       if isinstance(arg, bool): return dtypes.bool
       if isinstance(arg, int): return None
       if isinstance(arg, float): return dtypes.weakfloat
@@ -184,9 +184,11 @@ class UOpMetaClass(type):
   ucache:dict[tuple, weakref.ReferenceType[UOp]] = {}
   def __call__(cls, op:Ops, dtype:DType|None=None, src:tuple[UOp,...]=tuple(), arg:Any=None, tag:Any=None,
                metadata:tuple[Metadata,...]|None=None, _buffer:Buffer|None=None):
+    if op is Ops.CONST and arg is Invalid: dtype = dtypes.bool
     if dtype is None: dtype = dtype_from_uop(op, src, arg) or dtypes.void
     # CONST derives its dtype by value only when the constructor omits one; an explicit (strong) const dtype is legal until the field is removed
-    if SPEC == 2 and op is not Ops.CONST and (expected_dtype:=dtype_from_uop(op, src, arg)) is not None and expected_dtype != dtype:
+    if SPEC == 2 and op is not Ops.CONST and not any(s.base.arg is Invalid for s in src) and \
+       (expected_dtype:=dtype_from_uop(op, src, arg)) is not None and expected_dtype != dtype:
       raise RuntimeError(f"bad dtype {dtype}, expected {expected_dtype} on {op}")
     if (wret:=UOpMetaClass.ucache.get(key:=(op, dtype, src, arg, tag), None)) is not None and (ret:=wret()) is not None: return ret
     UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(*key))
@@ -603,7 +605,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if isinstance(b, UOp): return b.cast(dtype)
     # NOTE: it always has to be STACK now, even if they are all the same
     if isinstance(b, tuple):
-      stk = [UOp(Ops.CONST, dtype, arg=dtype.const(c), src=()) for c in b]
+      stk = [UOp.const(dtype, c) for c in b]
       ret = UOp.stack(*stk)
     else:
       ret = UOp(Ops.CONST, dtype, arg=dtype.const(b), src=())
@@ -630,15 +632,13 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     ret = UOp(Ops.REDUCE, src=(self.permute(perm),), arg=(op, len(reduce_axis)))
     return ret.reshape(tuple(s for i,s in enumerate(self.shape) if i not in axis)) if axis != reduce_axis else ret
   @staticmethod
-  def invalid(): return UOp.const(dtypes.weakint, Invalid)
+  def invalid(): return UOp.const(dtypes.bool, Invalid)
   def valid(self, cond):
     return cond.where(self, self.const_like(Invalid))
   def get_idx(self) -> UOp:
-    assert dtypes.is_int(self.dtype), "Can only call get_idx on index dtype"
     if self.op is Ops.STACK: return UOp.stack(*(x.get_idx() for x in self.src))
     return self.src[1] if self.op is Ops.WHERE and self.src[2].arg is Invalid else self
   def get_valid(self) -> UOp:
-    assert dtypes.is_int(self.dtype), "Can only call get_valid on index dtype"
     if self.op is Ops.STACK: return UOp.stack(*(x.get_valid() for x in self.src))
     return self.src[0] if self.op is Ops.WHERE and self.src[2].arg is Invalid else UOp.const(dtypes.bool, self.arg is not Invalid)
   def reduce(self, *src:UOp, **kwargs):
@@ -863,9 +863,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     out = graph_rewrite(idx, pm_mops+symbolic+pm_contiguous_view_offset, ctx=self, name="contiguous_view_offset")
     return out.arg if out.op is Ops.CONST and isinstance(out.arg, int) else None
 
-  def has_buffer_identity(self):
+  def has_buffer_identity(self, after_ok=False):
     """Check if this UOp has a concrete buffer identity in the graph (RESHAPE/MULTI -> BUFFER chain)."""
-    if self.op in {Ops.RESHAPE, Ops.MULTI}: return self.src[0].has_buffer_identity()
+    if self.op in {Ops.RESHAPE, Ops.MULTI, Ops.MSELECT}: return self.src[0].has_buffer_identity(after_ok)
+    if after_ok and self.op == Ops.AFTER: return self.src[0].has_buffer_identity(after_ok)
     return self.op in {Ops.BUFFER, Ops.SLICE, Ops.PARAM}
 
   def _base_buffer_is_realized(self) -> bool:
@@ -1140,6 +1141,12 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     kernel = fxn(*placeholders).call(*contig_srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in contig_srcs]
 
+  def to_elf(self) -> TinyELF:
+    assert self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo), "to_elf should only be called on a PROGRAM ast"
+    sig = tuple((u.arg.name, u.arg.slot, u.dtype, u._shape)
+                for u in tuple(filter(lambda u: u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU, self.src[1].src)) + self.arg.vars)
+    return TinyELF(self.src[3].arg, self.arg.function_name, self.arg.target, sig)
+
 @dataclass(frozen=True)
 class KernelInfo:
   name: str = "test"            # name of the kernel
@@ -1161,7 +1168,7 @@ class ProgramInfo:
   globals: tuple[int, ...] = ()
   outs: tuple[int, ...] = ()
   ins: tuple[int, ...] = ()
-  aux: tuple = ()
+  target: Target = Target()
 
   @property
   def function_name(self): return to_function_name(self.name)
@@ -1179,7 +1186,7 @@ class ProgramInfo:
     except KeyError as e: raise RuntimeError(f"unbound Variable {e} used by {self.function_name}") from None
 
   @staticmethod
-  def from_sink(sink:UOp, aux:tuple=()) -> ProgramInfo:
+  def from_sink(sink:UOp, target:Target=Target()) -> ProgramInfo:
     _vars: list[UOp] = []
     _globals: list[int] = []
     outs: list[int] = []
@@ -1199,7 +1206,7 @@ class ProgramInfo:
       if u.op is Ops.PARAM and u in _vars and u.expr == 'core_id': global_size[0] = int(u.vmax) + 1
     return ProgramInfo(sink.arg.name if isinstance(sink.arg, KernelInfo) else "test", tuple(global_size),
                        tuple(local_size) if local_size is not None else None, tuple(sorted(dedup(_vars), key=lambda v: v.arg.slot)),
-                       tuple(sorted(dedup(_globals))), tuple(sorted(dedup(outs))), tuple(sorted(dedup(ins))), aux)
+                       tuple(sorted(dedup(_globals))), tuple(sorted(dedup(outs))), tuple(sorted(dedup(ins))), target)
 
 @dataclass(frozen=True)
 class CallInfo:
@@ -1319,6 +1326,8 @@ class UPat(OpMixin):
   def f(self, op, **kwargs): return UPat(op, src=(self,), **kwargs)
 
   # copied from UOp
+  def sink(*srcs:UPat|None, **kwargs):  # pylint: disable=no-self-argument
+    return UPat(Ops.SINK, src=tuple([x for x in srcs if x is not None]), **kwargs)
   def index(self, *srcs:UPat|None, **kwargs):
     return UPat(Ops.INDEX, src=(self,)+tuple(x for x in srcs if x is not None), **kwargs)
   def cast(self, dtype=None, **kwargs):
@@ -1696,25 +1705,17 @@ def graph_rewrite(sink:UOp, pm:PatternMatcher, ctx=None, bottom_up=False, name=N
 def sint_to_uop(x:sint, dtype=dtypes.weakint) -> UOp: return UOp.const(dtype, x)
 def to_max_shape(shape:tuple[sint, ...]) -> tuple[int, ...]: return tuple(int(x.vmax) if isinstance(x, UOp) else x for x in shape)
 
-def select_dtype(u:UOp):
-  return dtypes.long if u.overflows(dtypes.int32) else dtypes.int
-def lower_alu_dtype(u:UOp, x:UOp, y:UOp, dt:DType) -> UOp:
-  src = u.src[:-2]+(x.cast(dt), y.cast(dt))
-  return src[0].alu(u.op, *src[1:]).cast(u.dtype)
+def select_dtype(u:UOp): return dtypes.long if u.overflows(dtypes.int32) else dtypes.int
+def lower_weakint_node(u:UOp) -> UOp|None:
+  start, src = (1 if u.op is Ops.WHERE else 0), tuple(s.src[0] if s.op is Ops.CAST and s.dtype is dtypes.weakint else s for s in u.src)
+  if src == u.src or any(s.dtype is dtypes.weakint for s in src[start:]): return None
+  dt = least_upper_dtype(select_dtype(u), *(s.dtype for s in src)) if u.op in GroupOp.Binary else unwrap(dtype_from_uop(u.op, src, u.arg))
+  return u.replace(dtype=None, src=src[:start]+tuple(s.cast(dt) for s in src[start:])).cast(u.dtype)
 pm_lower_weakint = PatternMatcher([
   # There are no Unary ops at this point in symbolic, those are introduced later
-  (UPat(Ops.CONST, dtype=dtypes.weakint, name="u"), lambda u: u.replace(dtype=select_dtype(u)).cast(u.dtype) if u.arg!=Invalid else None),
-  # Binary can widen the dtype, WHERE cannot
-  (UPat(GroupOp.Binary, name="u", src=(UPat.var("x").cast(dtypes.weakint), UPat.var("y").cast(dtypes.weakint))),
-   lambda u,x,y: lower_alu_dtype(u, x, y, least_upper_dtype(select_dtype(u), x.dtype, y.dtype))),
-  (UPat(Ops.WHERE, dtypes.weakint, src=(UPat(), UPat.var("x").cast(dtypes.weakint), UPat.var("y").cast(dtypes.weakint)), name="u"),
-   lambda u,x,y: lower_alu_dtype(u, x, y, least_upper_dtype(x.dtype, y.dtype))),
-  # in a weakint WHERE, an Invalid branch takes the dtype of the other branch
-  (UPat.var("gate").where(UPat.var("idx", dtypes.ints).cast(dtypes.weakint), UPat(Ops.CONST, arg=Invalid)),
-   lambda gate,idx: idx.valid(gate).cast(dtypes.weakint)),
-  (UPat(Ops.RANGE, src=(UPat.var("end").cast(dtypes.weakint)), name="r"), lambda r,end: r.replace(dtype=end.dtype, src=(end,)).cast(dtypes.weakint)),
-  (UPat(Ops.STACK, src=UPat().cast(dtypes.weakint), name="v"),
-    lambda v: v.replace(dtype=(dt:=select_dtype(v)), src=tuple(s.src[0].cast(dt) for s in v.src)).cast(dtypes.weakint)),
+  (UPat(Ops.CONST, dtype=dtypes.weakint, name="u"), lambda u: u.replace(dtype=select_dtype(u)).cast(u.dtype)),
+  # Binary can widen from the bounds, all other nodes derive from the lowered sources
+  (UPat(GroupOp.Binary|{Ops.WHERE, Ops.RANGE, Ops.STACK}, name="u"), lower_weakint_node),
   # special can only be int32
   (UPat(Ops.SPECIAL, src=(UPat.var("var").cast(dtypes.weakint),), name="u"),
     lambda u,var: u.replace(dtype=dtypes.int, src=(var,)).cast(dtypes.weakint)),

@@ -4,7 +4,7 @@ import sys, time, functools, itertools, math, operator, hashlib, os, types, pick
 from dataclasses import dataclass, replace
 from enum import Enum, auto
 from tinygrad.uop import Ops, GroupOp
-from tinygrad.dtype import ConstType, dtypes, DType, DTypeLike, truncate, least_upper_dtype, least_upper_float, Invalid, AddrSpace
+from tinygrad.dtype import ConstType, dtypes, DType, DTypeLike, truncate, least_upper_dtype, least_upper_float, Invalid, AddrSpace, strong_dtype
 from tinygrad.dtype import ConstFloat, PyConst, InvalidType, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
 from tinygrad.device import Buffer, MultiBuffer, canonicalize_device, TinyELF
 from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Context, partition, temp, unwrap, T, argfix, Metadata, flatten, TRACEMETA
@@ -94,6 +94,8 @@ def multirange_str(rngs:Iterable[UOp], color=False, pad=None) -> str:
   return ret
 
 def shape_to_shape_arg(arg:tuple[sint, ...]) -> UOp:
+  for x in arg:
+    if isinstance(x, UOp) and not dtypes.is_int(x.dtype): raise RuntimeError(f"shape must be int, got {x.dtype} in {arg}")
   if len(arg) == 0: return UOp(Ops.STACK)
   elif len(arg) == 1: return UOp.const(dtypes.weakint, arg[0])
   else: return UOp(Ops.STACK, src=tuple(UOp.const(dtypes.weakint, x) if isinstance(x, int) else x for x in arg))
@@ -155,7 +157,7 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType|None:
       return dtypes.uint64
     case Ops.SHL | Ops.SHR:
       if not dtypes.is_int(src[1].dtype): raise RuntimeError(f"shift distance must be int, got {src[1].dtype}")
-      return src[0].dtype
+      return promo_dtype(src)
     case Ops.BUFFER | Ops.PARAM:
       assert isinstance(arg, ParamArg), "BUFFER/PARAM must have ParamArg"
       return arg.dtype
@@ -171,7 +173,7 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType|None:
       # derived from the value. order matters: bool is an int subclass, ConstFloat is a float subclass
       if isinstance(arg, InvalidType): return dtypes.bool  # Invalid is always bool, the promo lattice bottom
       if isinstance(arg, bool): return dtypes.bool
-      if isinstance(arg, int): return None
+      if isinstance(arg, int): return dtypes.weakint
       if isinstance(arg, float): return dtypes.weakfloat
       raise TypeError(f"no dtype for CONST with arg {arg}")
   if op in GroupOp.Unary: return src[0].dtype
@@ -186,9 +188,10 @@ class UOpMetaClass(type):
                metadata:tuple[Metadata,...]|None=None, _buffer:Buffer|None=None):
     if op is Ops.CONST and arg is Invalid: dtype = dtypes.bool
     if dtype is None: dtype = dtype_from_uop(op, src, arg) or dtypes.void
-    # CONST derives its dtype by value only when the constructor omits one; an explicit (strong) const dtype is legal until the field is removed
-    if SPEC == 2 and op is not Ops.CONST and not any(s.base.arg is Invalid for s in src) and \
-       (expected_dtype:=dtype_from_uop(op, src, arg)) is not None and expected_dtype != dtype:
+    # CONST derives its dtype by value only when the constructor omits one
+    # TODO: delete this once the dtype field is removed, for now it just re-implements spec.py
+    if SPEC == 2 and op is not Ops.CONST and not (op in (Ops.SHL, Ops.SHR) and src[1].dtype == dtypes.uint and dtype == src[0].dtype) and \
+       not any(s.base.arg is Invalid for s in src) and (expected_dtype:=dtype_from_uop(op, src, arg)) is not None and expected_dtype != dtype:
       raise RuntimeError(f"bad dtype {dtype}, expected {expected_dtype} on {op}")
     if (wret:=UOpMetaClass.ucache.get(key:=(op, dtype, src, arg, tag), None)) is not None and (ret:=wret()) is not None: return ret
     UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(*key))
@@ -788,7 +791,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> UOp:
     device = canonicalize_device(self.device if device is None else device)
     axis = self.axis if isinstance(device, tuple) else None
-    ret = UOp.empty(self.shard_shape if axis is not None else self.shape, dtype=self.dtype if dtype is None else dtype, device=device)
+    ret = UOp.empty(self.shard_shape if axis is not None else self.shape, dtype=strong_dtype(self.dtype) if dtype is None else dtype, device=device)
     return ret.multi(axis) if axis is not None else ret
   @staticmethod
   def _frompy(x:list|tuple|bytes, dtype:DType, device:str|tuple[str, ...]|None=None) -> UOp:
@@ -1090,9 +1093,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # *** uop high level syntactic sugar ***
 
   @staticmethod
-  def placeholder(shape:tuple[int, ...], dtype:DType, slot:int, addrspace=AddrSpace.GLOBAL, device=None):
+  def placeholder(shape:tuple[int, ...], dtype:DType, slot:int, addrspace=AddrSpace.GLOBAL, device=None, volatile=False):
     if addrspace is AddrSpace.GLOBAL:
-      ret = UOp(Ops.PARAM, src=(shape_to_shape_arg((prod(shape),)),), arg=ParamArg(slot, dtype, addrspace=addrspace, device=device))
+      ret = UOp(Ops.PARAM, src=(shape_to_shape_arg((prod(shape),)),), arg=ParamArg(slot, dtype, addrspace=addrspace, device=device,volatile=volatile))
     else:
       assert addrspace in (AddrSpace.LOCAL, AddrSpace.REG)
       assert device is None, "LOCAL and REG placeholders cannot have a device"
@@ -1705,17 +1708,20 @@ def graph_rewrite(sink:UOp, pm:PatternMatcher, ctx=None, bottom_up=False, name=N
 def sint_to_uop(x:sint, dtype=dtypes.weakint) -> UOp: return UOp.const(dtype, x)
 def to_max_shape(shape:tuple[sint, ...]) -> tuple[int, ...]: return tuple(int(x.vmax) if isinstance(x, UOp) else x for x in shape)
 
-def select_dtype(u:UOp): return dtypes.long if u.overflows(dtypes.int32) else dtypes.int
-def lower_weakint_node(u:UOp) -> UOp|None:
-  start, src = (1 if u.op is Ops.WHERE else 0), tuple(s.src[0] if s.op is Ops.CAST and s.dtype is dtypes.weakint else s for s in u.src)
-  if src == u.src or any(s.dtype is dtypes.weakint for s in src[start:]): return None
-  dt = least_upper_dtype(select_dtype(u), *(s.dtype for s in src)) if u.op in GroupOp.Binary else unwrap(dtype_from_uop(u.op, src, u.arg))
+def select_dtype(u:UOp):
+  if u.dtype is dtypes.weakfloat: return dtypes.default_float
+  return dtypes.long if u.overflows(dtypes.int32) else dtypes.int
+def lower_weak_node(u:UOp) -> UOp|None:
+  start, src = (1 if u.op is Ops.WHERE else 0), tuple(s.src[0] if s.op is Ops.CAST and s.dtype in dtypes.weaks else s for s in u.src)
+  if src == u.src or any(s.dtype in dtypes.weaks for s in src[start:]): return None
+  dt = strong_dtype(least_upper_dtype(select_dtype(u), *(s.dtype for s in src)) if u.op in GroupOp.Binary
+                    else unwrap(dtype_from_uop(u.op, src, u.arg)))
   return u.replace(dtype=None, src=src[:start]+tuple(s.cast(dt) for s in src[start:])).cast(u.dtype)
-pm_lower_weakint = PatternMatcher([
-  # There are no Unary ops at this point in symbolic, those are introduced later
-  (UPat(Ops.CONST, dtype=dtypes.weakint, name="u"), lambda u: u.replace(dtype=select_dtype(u)).cast(u.dtype)),
-  # Binary can widen from the bounds, all other nodes derive from the lowered sources
-  (UPat(GroupOp.Binary|{Ops.WHERE, Ops.RANGE, Ops.STACK}, name="u"), lower_weakint_node),
+pm_lower_weak = PatternMatcher([
+  (UPat(Ops.CONST, dtype=dtypes.weaks, name="u"), lambda u: u.replace(dtype=select_dtype(u)).cast(u.dtype)),
+  # Binary can widen from the bounds, all other nodes derive from the lowered sources.
+  # a weakfloat Unary (sin/exp2/...) must resolve here, before the transcendental decomposition
+  (UPat(GroupOp.Binary|GroupOp.Unary|{Ops.WHERE, Ops.RANGE, Ops.STACK}, name="u"), lower_weak_node),
   # special can only be int32
   (UPat(Ops.SPECIAL, src=(UPat.var("var").cast(dtypes.weakint),), name="u"),
     lambda u,var: u.replace(dtype=dtypes.int, src=(var,)).cast(dtypes.weakint)),
@@ -1728,23 +1734,22 @@ def lower_weak_srcs(ctx:dict[UOp, UOp]|None, u:UOp) -> UOp|None:
   if ctx is None: ctx = {}
   def lower(s:UOp) -> UOp:
     if (r:=ctx.get(s)) is None:
-      r = graph_rewrite(s, pm_lower_weakint)
+      r = graph_rewrite(s, pm_lower_weak)
       # the consumer absorbs the cast on its own edge
-      ctx[s] = r = r.src[0] if r.op is Ops.CAST and r.dtype == dtypes.weakint else r
+      ctx[s] = r = r.src[0] if r.op is Ops.CAST and r.dtype in dtypes.weaks else r
     return r
   # a comparison demands a common operand width: lower it whole so the Binary rule unifies its operands
-  ret = lower(u) if u.op in GroupOp.Comparison else u.replace(src=tuple(lower(s) if s.dtype == dtypes.weakint else s for s in u.src))
+  ret = lower(u) if u.op in GroupOp.Comparison else u.replace(src=tuple(lower(s) if s.dtype in dtypes.weaks else s for s in u.src))
   return None if ret is u else ret
 pm_lower_index_dtype = PatternMatcher([
   (UPat(GroupOp.All, name="u"),
-   lambda ctx,u: lower_weak_srcs(ctx, u) if u.dtype != dtypes.weakint and any(s.dtype == dtypes.weakint for s in u.src) else None),
+   lambda ctx,u: lower_weak_srcs(ctx, u) if u.dtype not in dtypes.weaks and any(s.dtype in dtypes.weaks for s in u.src) else None),
   # a valid index into an n-element buffer lives in [0,n): a gated long index narrows when n-1 fits int32 (out-of-gate wraps, discarded)
   # TODO: more generic
   (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("gate").where(UPat.var("idx", dtypes.long), UPat(Ops.CONST, arg=Invalid))),
         allow_any_len=True, name="u"),
    lambda u,buf,gate,idx: u.replace(src=(buf, idx.cast(dtypes.int).valid(gate))+u.src[2:]) if buf.max_numel()-1 <= dtypes.int32.max else None),
 ])
-def _index_to_concrete_int(u:UOp) -> UOp: return graph_rewrite(u.sink(), pm_lower_index_dtype).src[0]
 
 _substitute = PatternMatcher([(UPat(tuple(Ops), name="x"), lambda ctx,x: ctx.get(x,None))])
 _pm_resolve_params = PatternMatcher([(UPat(Ops.PARAM, name="p"), lambda ctx,p: ctx[p.arg.slot])])

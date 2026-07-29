@@ -78,7 +78,7 @@ def split_reduceop(reduce:UOp, x:UOp):
   # split is moved to the end to provide maximum locality for the second phase reduce.
 
   # get expanded by rangeifying the UOp x
-  indexed = x.index(*[UOp.range(s, i) if resolve(s>1) else UOp.const(dtypes.weakint, 0) for i,s in enumerate(x.shape)])
+  indexed = x.index(*[UOp.range(s, i) if resolve(s>1) else 0 for i,s in enumerate(x.shape)])
   range_nums = [y.arg[0] for y in indexed.substitute({x.base:UOp(Ops.NOOP, x.base.dtype)}, extra_pm=pm_mops).ranges]
   is_expanded = [i not in range_nums for i in range(len(x.shape))]
 
@@ -342,8 +342,10 @@ def limit_bufs(ctx:IndexingContext, root:UOp):
     srcs = []
     for s in root.src:
       if s.op in GroupOp.Elementwise and s.device is not None:
-        # Insert bufferize: all AxisType.REDUCE before bufferize are AxisType.LOOP
-        orig_ranges, end_ranges = s.ranges, [x.replace(arg=(next(ctx.range_idx), AxisType.LOOP)) if x.op is Ops.RANGE else x for x in s.ranges]
+        # Insert bufferize: all AxisType.REDUCE before bufferize are AxisType.LOOP, the DEVICE range stays a launched axis
+        orig_ranges = s.ranges
+        end_ranges = [x.replace(arg=(next(ctx.range_idx), AxisType.LOOP)) if x.op is Ops.RANGE and x.arg[-1] is not AxisType.DEVICE else x
+                      for x in s.ranges]
         s = s.substitute(dict(zip(orig_ranges, end_ranges))).bufferize(*end_ranges, arg=BufferizeOpts(device=s.device)).index(*orig_ranges)
       srcs.append(s)
     return root.replace(src=tuple(srcs))
@@ -388,7 +390,7 @@ def bufferize_to_store(ctx:itertools.count, x:UOp, idx:UOp, allow_locals=True):
     # handle locals
     buf = UOp.placeholder((size,), dtype, next(ctx), AddrSpace.LOCAL)
     do_store = buf.index(idx).store(x.src[0].cast(dtype)).end(*rngs)
-    return buf.after(do_store.barrier()).cast(x.dtype)
+    return buf.after(do_store).cast(x.dtype)
 
 # collapse any BUFFERIZE to single input BUFFERIZE
 def flatten_bufferize(x:UOp):
@@ -516,8 +518,8 @@ pm_add_param_range_tags = PatternMatcher([
 ])
 
 def split_store(x:UOp) -> UOp|None:
-  # if we have any open ranges here, we don't split
-  if x.ranges: return None
+  # if we have any open ranges here, we don't split. open DEVICE ranges are fine, they are bound per device at launch
+  if any(r.arg[-1] is not AxisType.DEVICE for r in x.ranges): return None
 
   # local kernel rewrite
   lctx = LocalAddBufferContext()

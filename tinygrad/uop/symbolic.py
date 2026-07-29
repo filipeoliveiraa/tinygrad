@@ -70,16 +70,16 @@ invalid_pat = UPat(Ops.CONST, arg=Invalid, name="i")
 invalid_gate = UPat.var("cond").where(UPat.var("x"), invalid_pat)
 pm_data_invalid = PatternMatcher([
   (invalid_pat.broadcast(), lambda i: i),
-  (UPat(GroupOp.Unary|{Ops.BITCAST}, src=(invalid_pat,), name="op"), lambda i,op: i.cast(op.dtype)),
+  (UPat(GroupOp.Unary|{Ops.BITCAST}, src=(invalid_pat,)), lambda i: i),
   (UPat(GroupOp.Unary|{Ops.CAST, Ops.BITCAST}, src=(invalid_gate,), name="op"),
-   lambda cond,x,op,i: cond.where(op.replace(src=(x,)), i.cast(op.dtype))),
+   lambda cond,x,op,i: cond.where(op.replace(src=(x,)), i)),
   # binary ops move inside the gate, with Invalid in the false branch
-  (UPat(GroupOp.Binary, src=(invalid_gate, UPat.var("y")), name="alu"), lambda cond,x,y,alu,i: cond.where(x.alu(alu.op,y), i.cast(alu.dtype))),
-  (UPat(GroupOp.Binary, src=(UPat.var("y"), invalid_gate), name="alu"), lambda cond,x,y,alu,i: cond.where(y.alu(alu.op,x), i.cast(alu.dtype))),
+  (UPat(GroupOp.Binary, src=(invalid_gate, UPat.var("y")), name="alu"), lambda cond,x,y,alu,i: cond.where(x.alu(alu.op,y), i)),
+  (UPat(GroupOp.Binary, src=(UPat.var("y"), invalid_gate), name="alu"), lambda cond,x,y,alu,i: cond.where(y.alu(alu.op,x), i)),
   (UPat(GroupOp.Binary-GroupOp.Comparison, src=[invalid_pat, UPat()]), lambda i: i),
   # an Invalid condition poisons the whole where; a gated Invalid condition lifts the gate out
-  (invalid_pat.where(UPat.var("a"), UPat()), lambda i,a: i.cast(a.dtype)),
-  (invalid_gate.where(UPat.var("a"), UPat.var("b")), lambda cond,x,i,a,b: cond.where(x.where(a,b), i.cast(a.dtype))),
+  (invalid_pat.where(UPat(), UPat()), lambda i: i),
+  (invalid_gate.where(UPat.var("a"), UPat.var("b")), lambda cond,x,i,a,b: cond.where(x.where(a,b), i)),
   # normalize where(cond, Invalid, val) -> where(~cond, val, Invalid)
   (UPat.var("cond").where(invalid_pat, UPat.var("val")), lambda cond, i, val: cond.logical_not().where(val, i) if val.arg != Invalid else i),
   # lift Invalid out: a.where(cond.where(x, Invalid), c) -> (~a|cond).where(a.where(x, c), Invalid)
@@ -383,7 +383,7 @@ def reduce_mul_chain(r:UOp) -> UOp|None:
 
 def drop_and_clauses(cond:UOp, x:UOp, i:UOp) -> UOp|None:
   keep, drop = partition(cond.split_uop(Ops.AND), lambda c: any(r in x.ranges for r in c.ranges))
-  return UOp.const(dtypes.bool, True).uprod(*keep).where(x, i) if drop else None
+  return UOp.const(None, True).uprod(*keep).where(x, i) if drop else None
 pm_drop_and_clauses = PatternMatcher([(invalid_gate, drop_and_clauses)])
 
 # move conditions from where to load's valid, drop clauses already in load
@@ -398,7 +398,7 @@ def where_on_load(cond:UOp, buf:UOp, idx:UOp, or_cast:UOp) -> UOp|None:
   if len(keep) == len(where_clauses): return None
   idx = buf.index(idx.get_idx().valid(load_valid.uprod(*moved)))
   ret_idx = idx.cast(or_cast.dtype) if or_cast.op is Ops.CAST else idx
-  return UOp.const(dtypes.bool, True).uprod(*keep).where(ret_idx, ret_idx.const_like(0))
+  return UOp.const(None, True).uprod(*keep).where(ret_idx, ret_idx.const_like(0))
 
 # where after gated load becomes alt value, TODO: this is sort of duplicated with rules in devectorizer
 pm_move_where_on_load = PatternMatcher([

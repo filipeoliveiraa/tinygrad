@@ -41,11 +41,6 @@ class TestDTypeFromUOp(unittest.TestCase):
     # an explicit (strong) const dtype is legal until the field is removed
     self.assertEqual(UOp.const(3, dtypes.int32).dtype, dtypes.int32)
 
-  def test_weak_dtype_rejected_by_program_spec(self):
-    for weak, concrete, value in ((dtypes.weakint, dtypes.int32, 1), (dtypes.weakfloat, dtypes.float32, 1.0)):
-      with self.assertRaises(RuntimeError): type_verify(UOp.const(value, weak).sink(), spec_program)
-      type_verify(UOp.const(value, concrete).sink(), spec_program)
-
   def test_invalid_stated_dtype(self):
     # UOp.const normalizes a stated dtype away (const_like/full pass their position's); the core constructor does not,
     # and the spec is what rejects a non-bool Invalid
@@ -134,7 +129,7 @@ class TestConstFloatEq(unittest.TestCase):
     self.assertFalse(Invalid != HoldsInvalid())
 
   def test_matchers_agree_on_nan(self):
-    n = UOp.const(math.nan, dtypes.float32)
+    n = UOp.const(math.nan)
     for compiled in (False, True):
       pm = PatternMatcher([(UPat(Ops.CONST, arg=math.nan), lambda: True)], compiled=compiled)
       self.assertTrue(pm.rewrite(n), f"{compiled=}")

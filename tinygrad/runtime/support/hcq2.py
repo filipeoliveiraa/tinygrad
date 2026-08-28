@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast, TypeVar, Generic, Any, Sequence, Iterable
+from typing import cast, TypeVar, Generic, Any, Sequence, Iterable, TYPE_CHECKING
 import struct, functools, time, collections, itertools, decimal, statistics
 from dataclasses import replace, dataclass, field
 from tinygrad.helpers import suppress_finalizing, dedup, pluralize, JIT_BATCH_SIZE, unwrap, PROFILE
@@ -9,11 +9,11 @@ from tinygrad.device import ProfileDeviceEvent, ProfileGraphEntry, ProfileGraphE
 from tinygrad.uop.ops import Ops, sint, UOp, UPat, PatternMatcher, KernelInfo, graph_rewrite, rewrite_group, GroupOp
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.dtype import dtypes, truncate, DType
-from tinygrad.runtime.support.hcq import MMIOInterface, HCQBuffer
-from tinygrad.runtime.support.memory import BumpAllocator
+from tinygrad.runtime.support.memory import BumpAllocator, MMIOInterface
 from tinygrad.renderer import Renderer, Estimates
-from tinygrad.engine.realize import to_program, get_call_arg_uops, get_call_name, get_call_outs_ins, estimate_uop
-from tinygrad.engine.realize import pm_flatten_linear, lower_and_compile
+from tinygrad.engine.realize import to_program, get_call_arg_uops, get_call_name, get_call_outs_ins, estimate_uop, pm_flatten_linear,lower_and_compile
+
+if TYPE_CHECKING: from tinygrad.runtime.support.hcq import HCQBuffer # TODO: remove that
 
 # *****************
 # 0. helpers
@@ -139,7 +139,7 @@ def _get_enqueue_devs(call:UOp) -> Any|None:
 
 def copy_with_kernel(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   if (devs:=_get_enqueue_devs(call)) is None or Device[(dev:=to_tuple(devs)[0])].has_copy_queue: return None
-  d, s = (UOp.param(i, dst.dtype, (n:=dst.max_numel(),), device=devs) for i in range(2))
+  d, s = (UOp.param(i, dst.dtype, n:=dst.max_numel(), device=devs) for i in range(2))
   ast = d.index(r:=UOp.range(n, 0)).store(s.index(r).load()).end(r).sink(arg=KernelInfo(name="copy"), tag=1)
   return call.replace(src=(to_program(ast, Device[dev].renderer), dst, src))
 
@@ -168,8 +168,8 @@ class BatchCtx:
   slots:dict[str, int] = field(default_factory=lambda: collections.defaultdict(lambda: next(UOp.unique_num)))
 
 def _get_call_bufs_by_lane(call:UOp, devices:tuple[str, ...]) -> list[list[Any]]:
-  return [[b if (b:=_lane(a, lane)).op is Ops.PARAM or (b.op is Ops.MSELECT and b.src[0].op is Ops.PARAM) else b.buffer
-           for a in get_call_arg_uops(call)] for lane in range(len(devices))]
+  def dep_buf(b:UOp) -> Any: return base if (base:=(b.src[0] if b.op is Ops.MSELECT else b).base).op is Ops.PARAM else b.buffer
+  return [[dep_buf(_lane(a, lane)) for a in get_call_arg_uops(call)] for lane in range(len(devices))]
 
 def _wait_ins(ctx:BatchCtx, bufs_by_lane:list[list[Any]], write, devices:tuple[str, ...], queue:str, tag:int) -> list[UOp]:
   deps:list[Dep] = []
@@ -462,7 +462,7 @@ def hcq_lower(linear:UOp, pm_encode:PatternMatcher) -> UOp:
   linear = graph_rewrite(linear, pm_split_patches, walk=True, name="split patches")
 
   # and compile it
-  return lower_and_compile(graph_rewrite(linear, pm_replace_params, walk=True, name="replace params"))
+  with Context(EMULATED_DTYPES=""): return lower_and_compile(graph_rewrite(linear, pm_replace_params, walk=True, name="replace params"))
 
 @rewrite_group(lambda linear,input_uops,profile,ret: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
 def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool) -> UOp:

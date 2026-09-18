@@ -5,6 +5,7 @@ from tinygrad.helpers import Context
 
 class TestMultiRamUsage(unittest.TestCase):
   def setUp(self):
+    self.enterContext(Context(DEV="NULL"))
     gc.collect()
     self.baseline = GlobalCounters.mem_used
     self.baseline_per_device = dict(GlobalCounters.mem_used_per_device)
@@ -185,7 +186,7 @@ class TestMultiScalarALU(unittest.TestCase):
       return (inner.sum(),)
     param = x.as_param(0)
     fxn = _fxn(param.uop, x.device)
-    per_dev_scalar = Tensor(fxn[0].uop.call(x.uop).gettuple(0))
+    per_dev_scalar = Tensor(fxn[0].uop.call_with_output(x.uop))
     result = x * per_dev_scalar
     self.assertEqual(result.shape, (4, 4))
     self.assertEqual(result.uop.axis, 0)

@@ -10,6 +10,7 @@ ZERO_OPTIM = getenv("ZERO_OPTIM", 0)
 FP8_AMAX_MARGIN = getenv("FP8_AMAX_MARGIN", 1.1)
 IMMEDIATE_SCALE = getenv("IMMEDIATE_SCALE", 0)
 MXFP8 = getenv("MXFP8", 0)
+PRESTORE_WT = getenv("PRESTORE_WT", 0)
 
 def stochastic_round_bf16(x:Tensor) -> Tensor:
   bits = x.bitcast(dtypes.uint32)
@@ -27,8 +28,13 @@ def clip_grads(grads:list[Tensor], grad_acc, clip_norm) -> Tensor:
   for g in grads: g.assign((g * (clip_norm / (total_norm + 1e-6)).clamp(max_=1.0)).cast(g.dtype))
   return total_norm
 
-def fclip_grads(grads:list[Tensor], clip_norm) -> Tensor:
-  total_norm = Tensor.stack(*[g.float().square().sum() for g in grads]).sum().sqrt().contiguous()
+def fclip_grads(grads:list[Tensor], clip_norm) -> tuple[list[Tensor], Tensor]:
+  if getenv("FAST_GRAD_NORM", 0):
+    from extra.gptoss_kernels.grad_norm import sum_squares_bf16
+    squares = [sum_squares_bf16(g) if g.dtype == dtypes.bfloat16 else g.float().square().sum() for g in grads]
+  else:
+    squares = [g.float().square().sum() for g in grads]
+  total_norm = Tensor.stack(*squares).sum().sqrt().contiguous()
   scale = (clip_norm / (total_norm + 1e-6)).clamp(max_=1.0)
   return [(g * scale).cast(g.dtype) for g in grads], total_norm
 
@@ -104,6 +110,12 @@ class GradAccClipAdamW(Optimizer):
         new_e8 = w_e8.reshape(t._inv_scale.shape)
         t._inv_scale.assign(new_e8.shard_like(t._inv_scale) if offloaded else new_e8)
         ret = w_q.reshape(t.shape)
+        if PRESTORE_WT and hasattr(t, '_wT_q'):
+          from extra.gemm.cdna_asm_gemm import _mx_block_scale_3d
+          w_phys = ret.cast(dtypes.bfloat16) * _mx_block_scale_3d(new_e8).cast(dtypes.bfloat16)
+          wT_q, wT_e8, _ = quantize_mxfp8(w_phys.transpose(1, 2))
+          t._wT_q.assign(wT_q.shard_like(t._wT_q) if offloaded else wT_q)
+          t._wT_e8.assign(wT_e8.shard_like(t._wT_e8) if offloaded else wT_e8)
         return ret.shard_like(t) if offloaded else ret
       from examples.mlperf.models.flat_llama import FP8_MAX
       if IMMEDIATE_SCALE:

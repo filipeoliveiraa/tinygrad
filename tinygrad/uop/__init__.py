@@ -23,7 +23,7 @@ class Ops(FastEnum):
 
   # uops that aren't rendered
   NOOP = auto(); REWRITE_ERROR = auto()
-  # CALL is a kernel invocation; a CALL with a TUPLE body is value-producing (and gradient-able), the rest are opaque
+  # CALL is a kernel invocation; calls with RETURNED inputs are value-producing (and gradient-able), the rest are opaque
   PARAM = auto(); CALL = auto()
 
   # renderer
@@ -36,9 +36,6 @@ class Ops(FastEnum):
 
   # vector creation / item selection
   STACK = auto()
-
-  # tuple/gettuple for function with multiple returns
-  TUPLE = auto(); GETTUPLE = auto()
 
   # hcq specific
   GETADDR = auto()
@@ -87,7 +84,7 @@ class Ops(FastEnum):
   # ** 6 -- ops that don't exist in programs **
 
   # ops that adjust the behavior of the scheduler
-  CONTIGUOUS = auto(); CONTIGUOUS_BACKWARD = auto(); DETACH = auto()
+  CONTIGUOUS_BACKWARD = auto(); DETACH = auto()
 
   # buffer ops
   STAGE = auto(); COPY = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()

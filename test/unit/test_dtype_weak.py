@@ -54,6 +54,13 @@ class TestWeakPromotion(unittest.TestCase):
       self.assertEqual((r.dtype, r.tolist()), (dt, [1]))
       self.assertNotIn(Ops.CAST, [u.op for u in r._uop.toposort()])
 
+  def test_promote_keeps_shape_args(self):
+    # the shape arg is the same CONST as the value, only the value lifts
+    self.assertEqual((Tensor(5).expand(5) + 1.5).tolist(), [6.5]*5)
+    self.assertEqual((Tensor(2).reshape(1,1).expand(2,2).pad(((0,2),(0,0))) + 0.5).tolist(), [[2.5,2.5],[2.5,2.5],[0.5,0.5],[0.5,0.5]])
+    x, _ = Tensor(5).reshape(1).pad((1,1))._broadcasted(0.5)
+    self.assertEqual((x._uop.op, x._uop.base.dtype, x._uop.src[1].dtype), (Ops.PAD, dtypes.weakfloat, dtypes.weakint))
+
   def test_broadcasted_keeps_const_weak(self):
     # a python scalar stays a bare weak CONST through _broadcasted, lifted only to the KIND of the lub
     x, y = Tensor([1], dtype=dtypes.int8)._broadcasted(3)
@@ -101,6 +108,13 @@ class TestWeakPromotion(unittest.TestCase):
     self.assertIs(stacked.dtype, dtypes.weakfloat)
     self.assertEqual(stacked.tolist(), [2.0, -3.0])
 
+  def test_weakint_cast_truncates_for_every_consumer(self):
+    # a weakint cast of a float is a truncation whether a cast, a compare or an arithmetic op consumes it
+    x = Tensor([2.5, -3.5], dtype=dtypes.float32, device="CPU")
+    self.assertEqual(x.cast(dtypes.weakint).cast(dtypes.float32).tolist(), [2.0, -3.0])
+    self.assertEqual((x.cast(dtypes.weakint) * x).tolist(), [5.0, 10.5])
+    self.assertEqual(Tensor([0.5, -0.5], dtype=dtypes.float32, device="CPU").cast(dtypes.weakint).cast(dtypes.bool).tolist(), [False, False])
+
   def test_uop_scalar_const_lifts_kind(self):
     for dtype, value, out_dtype, const_dtype in ((dtypes.weakint, 1, dtypes.weakint, dtypes.weakint),
                                                  (dtypes.int32, 1, dtypes.int32, dtypes.weakint),
@@ -137,12 +151,12 @@ class TestWeakPromotion(unittest.TestCase):
     self.assertIs(mul.src[1], UOp.const(-1.0))
     self.assertIs(graph_rewrite(x * UOp.const(1.0000000106), symbolic_simple+pm_commit_weak), x)
 
-  def test_committed_const_conversion_folds_for_native_format(self):
+  def test_committed_const_conversion_folds(self):
     folded = graph_rewrite(UOp.const(16256, dtypes.ushort).cast(dtypes.uint), symbolic_simple)
     self.assertIs(folded, UOp.const(16256, dtypes.uint))
-    # fmt-less targets are lowered by renderer rewrites, where collapsing this pair would cycle with float-intermediate insertion.
+    # an emulated dtype const is a value too: one committed const, the renderer emits it directly
     emulated = UOp.const(1.0, dtypes.float).cast(dtypes.bfloat16)
-    self.assertIs(graph_rewrite(emulated, symbolic_simple), emulated)
+    self.assertIs(graph_rewrite(emulated, symbolic_simple), UOp.const(1.0, dtypes.bfloat16))
 
   def test_weak_shift_lhs_commits_the_node(self):
     # a shift derives its lhs's dtype, so committing the lhs restates the root (WGSL's packed store writes `mask << shift_am`)
@@ -240,6 +254,7 @@ class TestWeakBounds(unittest.TestCase):
   def test_padded_weak_const_keeps_its_zeros(self):
     self.assertEqual(Tensor(1).expand(1).cat(Tensor(2).expand(2), Tensor(3).expand(3)).tolist(), [1, 2, 2, 3, 3, 3])
     self.assertEqual((Tensor(5).reshape(1).pad((1, 1)) == 5).tolist(), [False, True, False])
+    self.assertEqual((Tensor(5).reshape(1,1).expand(1,2).pad(((0,2),(0,0))) + Tensor([[1],[2],[3]])).tolist(), [[6,6],[2,2],[3,3]])
 
 class TestWeakStorageBoundary(unittest.TestCase):
   # weak has no storage: a weak assignment source casts when it defers to the destination, everything else raises
@@ -305,7 +320,7 @@ class TestWeakMaterializationEntries(unittest.TestCase):
       # realize is a no-op, so a weak input can never become the real buffer TinyJit needs
       with self.assertRaises(JitError): TinyJit(lambda x: (x+1).realize())(t)
     # callify must not silently commit a weak CONTIGUOUS to storage
-    c = devful.alu(Ops.CONTIGUOUS)
+    c = Tensor(UOp(Ops.COPY, src=(devful.uop,), arg=devful.device))
     c.callify()
     self.assertIs(c.dtype, dtypes.weakfloat)
 

@@ -1,16 +1,18 @@
 import unittest, ctypes
 from tinygrad import Tensor, UOp
 from tinygrad.device import Device
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, AddrSpace
+from tinygrad.codegen import to_program
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.uop.ops import KernelInfo
 
+# an external call is a CALL on a CUSTOM_FUNCTION body holding the callee (the loaded function pointer)
 def call_out_kernel(F:UOp, C:UOp) -> UOp:
-  call = F[0].load().call(UOp.const(3).cast(dtypes.int), C[0], ret_dtype=dtypes.void)
+  call = UOp.custom_function("callback", F[0].load()).call(UOp.const(3).cast(dtypes.int), C[0], ret_dtype=dtypes.void)
   return C.after(call)[1].store(C.after(call)[0].load() + 1).sink(arg=KernelInfo(name="call_out"))
 
 def call_ret_kernel(F:UOp, C:UOp) -> UOp:
-  val = F[0].load().call(UOp.const(21).cast(dtypes.int), ret_dtype=dtypes.int)
+  val = UOp.custom_function("callback", F[0].load()).call(UOp.const(21).cast(dtypes.int), ret_dtype=dtypes.int)
   return C[0].store(val * 2).sink(arg=KernelInfo(name="call_ret"))
 
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, CStyleLanguage), "TODO: CALL is rendered in C style only")
@@ -35,5 +37,11 @@ class TestCall(unittest.TestCase):
     c = Tensor.custom_kernel(f, c, fxn=call_ret_kernel)[1]
     c.realize()
     self.assertEqual(c.item(), 44)
+
+  def test_call_stack_pointer(self):
+    slot = UOp.placeholder((1,), dtypes.uint32, addrspace=AddrSpace.REG)
+    call = UOp.custom_function("callback", UOp.const(0, dtypes.uint64)).call(slot[0], ret_dtype=dtypes.void)
+    prg = to_program(call.sink(arg=KernelInfo("call_stack")), Device["CPU"].renderer)
+    self.assertIn("(unsigned int*)((buf", prg.src[2].arg)
 
 if __name__ == "__main__": unittest.main()

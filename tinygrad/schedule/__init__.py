@@ -30,14 +30,14 @@ def create_schedule(sched_sink:UOp) -> UOp:
     # build kernel dependency graph: edges from producer kernel to consumer kernels
     children: dict[UOp, list[UOp]] = {}
     in_degree: dict[UOp, int] = {}
-    writes: dict[UOp, list[tuple[UOp, UOp, tuple[UOp, ...]]]] = {}  # buffer -> (AFTER, prior state, new kernels)
+    writes: dict[UOp, list[tuple[UOp, tuple[UOp, ...]]]] = {}  # superseded state -> (AFTER, new kernels)
     reads: list[tuple[UOp, UOp, UOp]] = []  # (reader AFTER, reader kernel, buffer state read)
     for u in sched_sink.toposort(gate_kernel_sink):
       if u.op is not Ops.AFTER: continue
       kernels, after_deps = _split_after(u)
       prev_state = _unwrap_src(u.src[0])
       prev_kernels = set(_split_after(prev_state)[0]) if prev_state.op is Ops.AFTER else set()
-      writes.setdefault(u.buf_uop, []).append((u, prev_state, tuple(k for k in kernels if k not in prev_kernels)))
+      writes.setdefault(prev_state, []).append((u, tuple(k for k in kernels if k not in prev_kernels)))
       for k in kernels:
         in_degree.setdefault(k, 0)
         if k.op is Ops.END: assert k.src[0].op is Ops.CALL, f"END src[0] should be KERNEL, not {k.src[0].op}"
@@ -53,8 +53,8 @@ def create_schedule(sched_sink:UOp) -> UOp:
     # WAR deps: a kernel reading buffer state S must run before another write that supersedes S. an AFTER only
     # supersedes its immediate prior state; join members already present in that prior state are ordering deps, not writes
     for u, k, s in reads:
-      for a, prev_state, write_kernels in writes.get(s.buf_uop, []):
-        if a is u or prev_state is not s: continue
+      for a, write_kernels in writes.get(s, []):
+        if a is u: continue
         for t in write_kernels:
           if t is not k and t not in k.backward_slice:
             children.setdefault(k, []).append(t)
@@ -71,7 +71,7 @@ def create_schedule(sched_sink:UOp) -> UOp:
         k = rk.src[0] if rk.op is Ops.END else rk
         assert k.op is Ops.CALL, f"unexpected op in queue: {k.op}"
         buf_uops = tuple(_unwrap_src(s).buf_uop for s in k.src[1:] if not s.is_bound_var)
-        linearized.append(k.src[0].call(*buf_uops))
+        linearized.append(k.body.call(*buf_uops))
       for x in children.get(rk, []):
         in_degree[x] -= 1
         if in_degree[x] == 0: queue.append(x)
@@ -99,13 +99,13 @@ pm_post_sched_cache = PatternMatcher([
 ])
 
 def resolve_linear_call(linear_call:UOp, outer_binds:dict[str, UOp]|None=None):
-  linear = graph_rewrite(linear_call.src[0], pm_post_sched_cache, ctx=({}, linear_call.src[1:]), walk=True, name="params to buffers")
+  linear = graph_rewrite(linear_call.body, pm_post_sched_cache, ctx=({}, linear_call.src[1:]), walk=True, name="params to buffers")
   # nested LINEAR calls are lexical scopes: their positional params shadow the enclosing scope, while calls without
   # scalar args (e.g. precompiled allreduce) inherit it
   binds = {**(outer_binds or {}),
            **{f"p{i}":x.src[0].replace(op=Ops.PARAM) for i,x in enumerate(linear_call.src[1:]) if x.is_bound_var}}
   def apply_binds(si:UOp) -> UOp:
-    if si.op is Ops.CALL and si.src[0].op is Ops.LINEAR: return resolve_linear_call(si, binds)
+    if si.op is Ops.CALL and si.body.op is Ops.LINEAR: return resolve_linear_call(si, binds)
     subs = {v:binds[v.expr] for v in si.variables() if v.expr in binds}
     return si.replace(src=tuple(s.substitute(subs, name="resolve scalar params") for s in si.src))
   return linear.replace(src=tuple(apply_binds(si) for si in linear.src))
@@ -117,9 +117,12 @@ pm_resolve_linear_call = PatternMatcher([
 
 schedule_cache: dict[bytes, UOp] = {}
 # ctx is just for DEBUG on inner
-def lower_sink_to_linear(function:UOp) -> UOp|None:
+def lower_sink_to_linear(call:UOp) -> UOp|None:
+  function = call.body
+  if function.op is not Ops.SINK or isinstance(function.arg, KernelInfo): return None
+  # value calls (with unbound outputs) are inlined positionally during prepare: their bodies are not programs to schedule
+  if call.has_unbound_outputs: return None
   st = time.perf_counter()
-  if isinstance(function.arg, KernelInfo): return None
   cache_key = function.key
   if not SCACHE or (sc_ret:=schedule_cache.get(cache_key, None)) is None:
     if SPEC: type_verify(function, spec_tensor)
@@ -139,10 +142,10 @@ def lower_sink_to_linear(function:UOp) -> UOp|None:
     print(f"scheduled {len(linear.src):5d} kernels in {(time.perf_counter()-st)*1000:8.2f} ms"+\
           f" | {' cache hit' if SCACHE and sc_ret is not None else 'CACHE MISS'} {cache_key.hex()[:8]}"+\
           f" | {len(UOpMetaClass.ucache):7d} uops in cache"+("" if frm is None else f" | {frm.filename}:{frm.lineno}"))
-  return linear
+  return call.replace(src=(linear,)+call.src[1:])
 
 pm_schedule = PatternMatcher([
-  (UPat(Ops.SINK, name="function"), lower_sink_to_linear),
+  (UPat(Ops.CALL, name="call"), lower_sink_to_linear),
 ])
 
 def assert_all_same_devices(ast:UOp):

@@ -2,10 +2,13 @@
 import math, unittest
 import numpy as np
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import Timing, Context, cdiv
+from tinygrad.helpers import Timing, Context, cdiv, Target
 from tinygrad.dtype import dtypes, AddrSpace, ConstFloat, Invalid  # noqa: F401
 from tinygrad.device import Device
 from tinygrad.uop.ops import Ops, AxisType, ParamArg, PatternMatcher, UOp, UPat, dtype_from_uop, exec_alu, graph_rewrite  # noqa: F401  # ParamArg used by eval(str(uop)) roundtrip tests
+from tinygrad.codegen.late.coalesce import memory_coalescing
+from tinygrad.renderer import Renderer
+from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.uop.weak import pm_lower_weak
 from tinygrad.uop.spec import spec_program, spec_shared, type_verify
 from tinygrad.uop.symbolic import sym, pm_remove_invalid
@@ -62,6 +65,12 @@ class TestDTypeFromUOp(unittest.TestCase):
     out = graph_rewrite(stack, pm_remove_invalid)
     self.assertEqual(out.src, (UOp.const(1, dtypes.half), UOp.const(0, dtypes.half)))
     type_verify(out.sink(), spec_program)
+
+class TestMemoryCoalescing(unittest.TestCase):
+  def test_volatile_view_not_coalesced(self):
+    buf = UOp.param(0, dtypes.uint32, 4, volatile=True).bitcast(dtypes.int32)
+    sink = memory_coalescing(UOp.sink(*(buf.index(i).load() for i in range(4))), Renderer(Target()))
+    self.assertEqual(sum(u.op is Ops.LOAD for u in sink.toposort()), 4)
 
 class TestLowerIndexDtype(unittest.TestCase):
   def test_gated_shrink_lowers_to_selected_width(self):
@@ -269,7 +278,6 @@ class TestGatedStoreRewrite(unittest.TestCase):
     for x in gated_uops: self.assertIs(x.op, Ops.STORE)
     for x in gated_uops: self.assertEqual(len(x.src), 2)
 
-@unittest.skipIf(Device.DEFAULT == "METAL", "compiler bug")
 @unittest.skipUnless(Ops.SHR in Device[Device.DEFAULT].renderer.code_for_op, "fast_idiv requires SHR")
 class TestFastIdiv(unittest.TestCase):
   def test_division_power_of_two(self):
@@ -296,6 +304,13 @@ class TestFastIdiv(unittest.TestCase):
       self.assertNotIn(Ops.CMOD, ops, f"For dtype={dt} FLOORMOD by pow2 left a MOD")
       self.assertNotIn(Ops.FLOORMOD, ops, f"For dtype={dt} FLOORMOD survived past late rewrite")
 
+  def test_max_keeps_bound_for_idiv(self):
+    # MAX is lowered to CMPLT+WHERE only after floordiv_to_idiv, so the bound it carries still proves the division same-sign
+    x = UOp.param(0, dtypes.int32, 3).index(UOp.const(2)).maximum(0) + 1
+    ops = [u.op for u in to_uops_list([x // 3], ren=CStyleLanguage(Target()))]
+    self.assertNotIn(Ops.MAX, ops, "the renderer has no MAX")
+    self.assertNotIn(Ops.CMOD, ops, "a provably positive dividend kept the round toward zero correction")
+
   def test_floordiv_power_of_two(self):
     # FLOORDIV by a power of two lowers to a shift, with no round toward zero correction (a shift is exactly floor division)
     for dt in (dtypes.int32, dtypes.uint32, dtypes.int64, dtypes.uint64):
@@ -309,8 +324,15 @@ class TestFastIdiv(unittest.TestCase):
       self.assertNotIn(Ops.CMOD, ops, f"For dtype={dt} FLOORDIV by pow2 kept the round toward zero correction")
       self.assertNotIn(Ops.FLOORDIV, ops, f"For dtype={dt} FLOORDIV survived past late rewrite")
 
+  def test_unsigned_floordiv_is_cdiv(self):
+    for op in (Ops.FLOORDIV, Ops.FLOORMOD):
+      a, b = (UOp.param(i, dtypes.uint32, 3).index(UOp.const(2)) for i in range(2))
+      ops = [x.op for x in to_uops_list([UOp(op, src=(a, b))], ren=Device[Device.DEFAULT].renderer)]
+      self.assertNotIn(Ops.CMPLT, ops, f"{op} on unsigned kept the sign correction")
+      self.assertEqual(ops.count(Ops.CDIV) + ops.count(Ops.CMOD), 1)
+
   @Context(DISABLE_FAST_IDIV=0)
-  @unittest.skipIf(Device.DEFAULT == "WEBGPU", "WEBGPU doesn't support long")
+  @unittest.skipUnless(dtypes.uint64 in Device[Device.DEFAULT].renderer.supported_dtypes(), "fast_idiv widens uint32 to uint64")
   def test_fast_idiv_and_mod(self):
     g = UOp.param(0, dtypes.uint32, 4)
     c = UOp.const(3)
@@ -330,6 +352,25 @@ class TestFastIdiv(unittest.TestCase):
     self.assertNotIn(Ops.CMOD, ops)
 
   @Context(DISABLE_FAST_IDIV=0)
+  def test_fast_idiv_nonpositive_divisor(self):
+    ridx = UOp.range(20, 0)
+    for d in (-3, 0):
+      for op in (Ops.CDIV, Ops.CMOD):
+        ops = [x.op for x in to_uops_list([ridx.alu(op, UOp.const(d))], ren=Device[Device.DEFAULT].renderer)]
+        self.assertNotIn(Ops.SHR, ops, f"fast_idiv fired on {op} by {d}")
+
+  @Context(DISABLE_FAST_IDIV=0)
+  @unittest.skipUnless(dtypes.uint64 in Device[Device.DEFAULT].renderer.supported_dtypes(), "needs a uint64 buffer")
+  def test_fast_idiv_cmod_kept_when_idiv_declines(self):
+    ren = Device[Device.DEFAULT].renderer
+    d = UOp.param(0, dtypes.int32, 4).index(UOp.const(0))
+    ops = [x.op for x in to_uops_list([UOp.range(30, 0).alu(Ops.CMOD, d)], ren=ren)]
+    self.assertIn(Ops.CMOD, ops, "CMOD by a non-const divisor should be left alone")
+    big = UOp.param(1, dtypes.uint64, 4).index(UOp.const(0))
+    ops = [x.op for x in to_uops_list([big.alu(Ops.CMOD, UOp.const(3, dtypes.uint64))], ren=ren)]
+    self.assertIn(Ops.CMOD, ops, "CMOD should be left alone when fast_idiv declines")
+
+  @Context(DISABLE_FAST_IDIV=0)
   def test_fast_idiv_bounded_numerator_zero(self):
     x = UOp.variable("x", 0, 1, dtype=dtypes.int32)
     for val in range(2):
@@ -342,6 +383,7 @@ class TestFastIdiv(unittest.TestCase):
     # this requires shifting out the powers of two before doing fast_idiv
     # (((ridx0>>6)*18725)>>17) instead of (int)((((long)(ridx0)*1198373)>>29))
     self.assertNotIn(dtypes.long, [x.dtype for x in uops])
+    self.assertNotIn(Ops.CDIV, [x.op for x in uops])
 
   @unittest.expectedFailure
   def test_fast_idiv_overflow(self):

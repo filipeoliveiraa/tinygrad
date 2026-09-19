@@ -2,7 +2,8 @@ from __future__ import annotations
 from typing import cast, Any, Sequence
 import functools, itertools, weakref, ctypes, importlib
 from dataclasses import replace, dataclass, field
-from tinygrad.helpers import dedup, pluralize, unwrap, VIZ, HCQ2, to_tuple, ContextVar, Context, panic, partition, DEV, ALL2ALL, getenv, round_up
+from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, ContextVar, Context, panic, partition, getenv, round_up
+from tinygrad.helpers import DEBUG, VIZ, HCQ2, DEV, ALL2ALL
 from tinygrad.device import Device, Buffer, BufferSpec, DepsTracker, TinyELF, HCQ_RUNTIME_DEV
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu
 from tinygrad.dtype import dtypes, DTYPES_DICT, AddrSpace
@@ -21,12 +22,12 @@ HCQ_DEVS = frozenset(("NV", "QCOM", "CUDA")) | (frozenset(("AMD",)) if HCQ2 else
 class HCQInfo:
   device:tuple[str, ...]
 
-  kernels:tuple[tuple[tuple[str, ...], str, Estimates, tuple[int, ...], bytes], ...] = () # (devices, name, estimates, timestamp slots, profile key)
+  kernels:tuple[tuple, ...] = () # (devices, name, estimates, timestamp slots, profile key, buffers, (outs, ins))
   estimates:Estimates = Estimates()
 
   nargs:int = 0
   table:int = -1
-  inputs:tuple[tuple[UOp, str, int], ...] = ()
+  inputs:tuple[tuple[UOp, int, str], ...] = ()
   slots:tuple[tuple[str, int], ...] = () # per device, the position of its batch slots in the args
   host_deps:tuple[tuple[str, str], ...] = () # (memory owner, accessing device)
   written_bufs:tuple[UOp, ...] = () # write args
@@ -62,11 +63,6 @@ def to_name(*parts:str) -> str: return "_".join(parts).replace(":", "_").lower()
 
 def timeline(devs:tuple[str, ...]) -> UOp: return UOp.placeholder((2,), dtypes.uint64, 0, device=devs, volatile=True, tag="timeline")
 def timeline_value(devs:tuple[str, ...]) -> UOp: return timeline(devs).index(1).load()
-
-def rt_addr(b:UOp, dev="CPU", *deps:UOp) -> UOp:
-  base, off = unwrap_view(b)
-  word = UOp.placeholder((1,), dtypes.uint64, device=Device[to_tuple(dev)[0]].host, tag="addr")
-  return patch(word, [(0, base.bitcast(dtypes.uint8)[off:off + b.nbytes()].getaddr(dev))]).after(*deps).index(0).load()
 
 def make_submit(*cmds, devs:str|tuple[str, ...], queue:str) -> UOp:
   fn = to_name("submit", (devs:=to_tuple(devs))[0].split(":")[0], queue.split(":")[0])
@@ -275,8 +271,9 @@ def _finalize_batch(ctx:BatchCtx, skip_wait:bool=False) -> UOp:
   names = [get_call_name(c, get_call_arg_uops(c)) for c, _, _ in ctx.batch]
   estimates = [estimate_uop(c) for c, _, _ in ctx.batch]
   stamps = [tuple(2 * s + 1 for s in ctx.stamps(d, tag)) for tag, (_, d, _) in enumerate(ctx.batch)]
-  profile_keys = [getattr(c.body.arg, "profile_key", None) for c, _, _ in ctx.batch]
-  kerns:tuple[tuple, ...] = tuple(zip([d for _, d, _ in ctx.batch], names, estimates, stamps, profile_keys))
+  profile_keys = [c.body.key if c.body.op is Ops.PROGRAM else None for c, _, _ in ctx.batch]
+  bufs = [tuple(unwrap_view(get_call_arg_uops(c)[g])[0] for g in getattr(c.body.arg, "globals", (0, 1))) for c, _, _ in ctx.batch] # copy is dst, src
+  kerns = tuple(zip([d for _, d, _ in ctx.batch], names, estimates, stamps, profile_keys, bufs, [get_call_outs_ins(c) for c, _, _ in ctx.batch]))
   written_bufs = tuple(dedup(b for c, _, _ in ctx.batch for b in get_call_written_bufs(c)))
   host_deps = tuple(dedup((host, devs[0]) for call, devs, _ in ctx.batch for buf in get_call_arg_uops(call)
                          for host in to_tuple(buf.device) if host not in ctx.queues))
@@ -311,10 +308,7 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
 @dataclass
 class EncodeCtx:
   devs:tuple[str, ...]
-  inputs:dict[tuple[UOp, str, int], int] = field(default_factory=dict)
   lt_patches:list[UOp] = field(default_factory=list)
-
-  def __post_init__(self): self.table = UOp.placeholder((1,), dtypes.uint64, device=Device[self.devs[0]].host, tag="inputs")
 
 class HWQueue:
   q_rewrite = PatternMatcher([
@@ -403,12 +397,6 @@ pm_hcq_encode = PatternMatcher([
 
 def _is_input_addr(g:UOp) -> bool: return (base:=unwrap_lane(g.src[0])[0]).op is Ops.PARAM and base.tag is None
 
-def addrs_to_table(ctx:EncodeCtx, g:UOp) -> UOp|None:
-  if not _is_input_addr(g): return None
-  base, off = unwrap_view(g.src[0])
-  slot = ctx.inputs.setdefault((base, to_tuple(g.arg)[0], off), len(ctx.inputs))
-  return ctx.table.index(slot).load()
-
 def _is_link_patch(w:UOp) -> bool:
   if w.op is Ops.GETADDR: return not _is_input_addr(w)
   if w.op is Ops.PARAM: return w.tag is not None
@@ -422,7 +410,7 @@ def hoist_links(ctx:EncodeCtx, a:UOp) -> UOp|None:
   ctx.lt_patches.extend(links)
   return a.src[0].after(*rest)
 
-pm_patches = PatternMatcher([(UPat(Ops.GETADDR, name="g"), addrs_to_table), (UPat(Ops.AFTER, name="a"), hoist_links)])
+pm_patches = PatternMatcher([(UPat(Ops.AFTER, name="a"), hoist_links)])
 
 def patch(buf:UOp, rows:Sequence[tuple[int|UOp, UOp]], blob:bytes|None=None) -> UOp:
   # group into stacks based on dtype, alignment, is_link (rt/lt can't share a store) and ranges (a ranged offset is a loop)
@@ -488,8 +476,16 @@ def lower_call(call:UOp) -> UOp|None:
                        ctx=ctx, bpm=pm_patches, name="encode")
   body = graph_rewrite(body, sum([d.pm_lower for d in devs if d.pm_lower is not None], PatternMatcher([])), ctx=ctx, bpm=pm_patches, name="lower")
 
-  # resize table
-  body = body.substitute({ctx.table: (table:=ctx.table.replace(arg=replace(ctx.table.arg, size=len(ctx.inputs))))})
+  # unwrap to base and byte offset. drops afters (an address has no deps) and merges views into one slot
+  def normalize(g:UOp) -> UOp: return (v:=unwrap_view(g.src[0]))[0].bitcast(dtypes.uint8)[v[1]:v[0].nbytes()].getaddr(to_tuple(g.arg)[0])
+  normalized = {g: normalize(g) for g in body.toposort() if g.op is Ops.GETADDR}
+
+  # runtime addrs load from a table: inputs filled per call, the rest at link
+  input_addrs, link_addrs = partition(rt_addrs:=dedup(normalized.values()), _is_input_addr)
+  table = UOp.placeholder((len(rt_addrs),), dtypes.uint64, device=Device[ctx.devs[0]].host, tag="inputs")
+  slot_of = {g: i for i, g in enumerate(input_addrs + link_addrs)}
+  body = body.substitute({g: table.index(slot_of[n]).load() for g, n in normalized.items()})
+  ctx.lt_patches += patch(table, [(8 * slot_of[g], g) for g in link_addrs]).src[1:]
 
   # combine placeholders into one and replace with views
   words = [u for u in body.toposort() if u.op is Ops.PARAM and u.tag not in (None, "program") and u.arg.slot]
@@ -515,7 +511,8 @@ def lower_call(call:UOp) -> UOp|None:
   if VIZ: graph_rewrite(UOp.sink(*patches), PatternMatcher([]), name="View Link-Time Patches")
   if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Body")
 
-  info = replace(call.arg.aux, nargs=len(bufs), table=bufs.index(table) if table in bufs else -1, inputs=tuple(ctx.inputs),
+  info = replace(call.arg.aux, nargs=len(bufs), table=bufs.index(table) if table in bufs else -1,
+                 inputs=tuple((*unwrap_view(g.src[0]), g.arg) for g in input_addrs),
                  slots=tuple((to_tuple(b.device)[0], i) for i, b in enumerate(bufs) if b.tag == "slots"))
   return call.replace(src=(sink, *bufs), arg=replace(call.arg, aux=info)).after(*patches)
 pm_encode = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.SINK),), name="call", allow_any_len=True), lower_call)])
@@ -533,7 +530,7 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache=False
   linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, ctx=tuple(input_uops or ()), name="prep calls")
   if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_encode, walk=True, name="encode")
-  with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin)
+  with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
   if cache and input_uops is not None and final_linear is not linear: hcq_compile_cache[key] = final_linear
   return final_linear
 

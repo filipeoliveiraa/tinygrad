@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, function, Device
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import UOp, Ops
+from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.tensor import transform_to_call
 
 def sched_key(t:Tensor): return transform_to_call(UOp.sink(t.uop))[0].src[0].key
@@ -196,6 +196,38 @@ class TestCallSchedule(unittest.TestCase):
     def s(x): return x*2
     s(s(a).contiguous()).realize()
 
+  def test_contiguous_call_output_realizes_aliases(self):
+    def increment(x:UOp):
+      i = UOp.range(x.shape[0], 0)
+      return x[i].store(x[i].load() + 1).end(i).sink(arg=KernelInfo(name="increment"))
+
+    for precompile in (False, True):
+      for reshape in (False, True):
+        with self.subTest(precompile=precompile, reshape=reshape):
+          @function(precompile=precompile)
+          def f(x:Tensor): return x.custom_kernel(fxn=increment)[0]
+          state = Tensor([1., 2.]).realize()
+          a = f(state)
+          alias = a.reshape(1, 2)
+          b = (alias if reshape else a).contiguous().realize()
+          self.assertEqual(b.flatten().tolist(), [2., 3.])
+          a.realize(alias)
+          self.assertEqual(state.tolist(), [2., 3.])
+          self.assertIs(a.uop.buffer, b.uop.buffer)
+          self.assertIs(alias.uop.buffer, b.uop.buffer)
+          b.assign([9., 10.]).realize()
+          self.assertEqual(a.tolist(), [9., 10.])
+          self.assertEqual(alias.tolist(), [[9., 10.]])
+
+  def test_assign_call_output_to_input(self):
+    for precompile in (False, True):
+      with self.subTest(precompile=precompile):
+        @function(precompile=precompile)
+        def f(x:Tensor): return x.flip(0).contiguous()
+        a = Tensor.arange(1024).clone().realize()
+        a.assign(f(a)).realize()
+        self.assertEqual(a.tolist(), list(reversed(range(1024))))
+
   def test_call_double_gemm(self):
     a = Tensor.randn(4, 8)
     b = Tensor.randn(8, 12)
@@ -301,7 +333,7 @@ class TestCallSchedule(unittest.TestCase):
           if devices is not None: x = x.shard(devices, axis=0).realize()
           out = outer(x)
           for call in (u for u in out.uop.toposort() if u.op is Ops.CALL):
-            self.assertTrue(all(b.is_unbound for b in call.body.toposort() if b.op is Ops.BUFFER))
+            self.assertFalse(any(b.op is Ops.BUFFER for b in call.body.toposort()))
           self.assertEqual(sched_key(out), sched_key(outer(x)))
           out.sum().backward()
           np.testing.assert_equal(out.numpy(), [6., 9., 12., 15.])

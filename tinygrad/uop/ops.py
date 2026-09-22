@@ -10,7 +10,7 @@ from tinygrad.device import Buffer, MultiBuffer, canonicalize_device, is_disk_de
 from tinygrad.helpers import ContextVar, all_int, prod, getenv, all_same, Context, partition, temp, unwrap, T, argfix, Metadata, flatten, TRACEMETA
 from tinygrad.helpers import PROFILE, dedup, cdiv, cmod, floordiv, floormod, diskcache_put, to_function_name, cpu_profile, TracingKey
 from tinygrad.helpers import VIZ, SPEC, CAPTURE_PROCESS_REPLAY, DISALLOW_BROADCAST, get_shape, fully_flatten, to_tuple
-from tinygrad.helpers import colored, ansilen, printable, Target, is_image_shape
+from tinygrad.helpers import colored, ansilen, printable, Target, is_image_shape, strides_for_shape
 if TYPE_CHECKING:
   from tinygrad.renderer import Estimates
 
@@ -94,8 +94,8 @@ def ssimplify(uop:sint): return uop.ssimplify() if isinstance(uop, UOp) else uop
 def sym_infer(uop: UOp|int, var_vals: dict[str, int]) -> int: return uop.sym_infer(var_vals) if isinstance(uop, UOp) else uop
 
 def range_str(u:UOp, color=False) -> str:
-  ret = '_'.join([str(x) if x >= 0 else "m"+str(-x) for x in u.arg[0:-1]])
-  return colored(ret, axis_colors[u.arg[-1]]) if color else ret
+  ret = '_'.join([str(x) if x >= 0 else "m"+str(-x) for x in u.axis_id])
+  return colored(ret, axis_colors[u.axis_type]) if color else ret
 
 def multirange_str(rngs:Iterable[UOp], color=False, pad=None) -> str:
   ret = ','.join([range_str(x, color=color) for x in sorted(rngs, key=lambda x: x.arg)])
@@ -124,7 +124,7 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType:
   # here are the dtype production rules, total over all Ops
   match op:
     case Ops.STORE | Ops.LINEAR | Ops.SINK | Ops.PROGRAM | Ops.SOURCE | \
-         Ops.END | Ops.BARRIER | Ops.GROUP | Ops.IF | Ops.ENDIF | Ops.NOOP | \
+         Ops.END | Ops.BACKEDGE | Ops.BARRIER | Ops.GROUP | Ops.IF | Ops.ENDIF | Ops.NOOP | \
          Ops.CUSTOM_FUNCTION | Ops.REWRITE_ERROR | Ops.PYLITERAL:
       # always void
       return dtypes.void
@@ -225,6 +225,13 @@ class recursive_property(property):
     for node in x.toposort(gate=lambda node: self.nm not in node.__dict__): node.__dict__[self.nm] = self.fxn(node)
     return x.__dict__[self.nm]
 
+class _UOpTuple(tuple):
+  # UOps are hash-consed, so structurally identical UOps are the same object and equality can be identity.
+  # This keeps tuple < from rescanning deep equal prefixes with O(n) value equality at every level of the walk.
+  __hash__ = tuple.__hash__
+  def __eq__(self, other): return self is other
+  def __ne__(self, other): return self is not other
+
 # we import this late so we can use resolve/smax in mixins
 from tinygrad.mixin.rand import RandMixin
 
@@ -312,9 +319,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return cache[self]
 
   @functools.cached_property
-  def tuplize(self:UOp) -> tuple:
+  def tuplize(self) -> _UOpTuple:
     # arg goes through repr: args of different types (None, str, tuple) must stay mutually comparable for the sort
-    return (self.op.value, repr(self.arg), self.dtype,)+tuple([x.tuplize for x in self.src])
+    return _UOpTuple((self.op.value, repr(self.arg), self.dtype,)+tuple([x.tuplize for x in self.src]))
 
   # *** uop shape stuff ***
 
@@ -322,7 +329,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def _shape(self) -> tuple[sint, ...]|None:
     match self.op:
       # late ops don't have shape
-      case Ops.IF | Ops.BARRIER | Ops.SINK | Ops.REWRITE_ERROR | Ops.ENDIF | Ops.GROUP | \
+      case Ops.IF | Ops.BARRIER | Ops.SINK | Ops.REWRITE_ERROR | Ops.ENDIF | Ops.BACKEDGE | Ops.GROUP | \
            Ops.LINEAR | Ops.PROGRAM | Ops.SOURCE:
         return None
 
@@ -463,6 +470,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def ended_ranges(self) -> tuple[UOp, ...]:
     if self.op is Ops.CALL and self.body.op is Ops.CUSTOM_FUNCTION and self.body.src: return ()
     if self.op is Ops.END: return tuple(r for r in self.src[1:] if r.op is Ops.RANGE)
+    if self.op is Ops.BACKEDGE: return self.src[1:2]  # the condition's other ranges remain live
     if self.op in range_start: return self.src[range_start[self.op]:]
     if self.op is Ops.AFTER: return tuple(flatten([x.ended_ranges for x in self.src[1:]]))
     # UNSHARD ends the DEVICE range: its src is per-device index math, the device axis is carried by the axis metadata
@@ -488,6 +496,16 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def ranges(self) -> dict[UOp, None]:
     if self.op is Ops.RANGE: return {self:None} | self._ranges
     return self._ranges
+
+  @property
+  def axis_id(self) -> tuple[int, ...]:
+    assert self.op is Ops.RANGE, f"axis_id is only for RANGE, not {self.op}"
+    return self.arg[0:-1]
+
+  @property
+  def axis_type(self) -> AxisType:
+    assert self.op is Ops.RANGE, f"axis_type is only for RANGE, not {self.op}"
+    return self.arg[-1]
 
   # *** uop evaluation ***
 
@@ -598,13 +616,14 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     srcs = (self, self.const_like(src) if not isinstance(src, UOp) else src) + ((gate,) if gate is not None else ())
     return UOp(Ops.STORE, src=srcs, **kwargs)
   def end(self, *src:UOp): return UOp(Ops.END, src=(self,)+src) if len(src) else self
+  def backedge(self, loop:UOp, cond:UOp): return UOp(Ops.BACKEDGE, src=(self, loop, cond))
   def after(self, *src:UOp, **kwargs): return UOp(Ops.AFTER, src=(self,)+src, **kwargs) if len(src) else self
   @property
   def without_after(self) -> UOp: return self.src[0].without_after if self.op is Ops.AFTER else self
   def barrier(self, *src:UOp): return UOp(Ops.BARRIER, src=(self,)+src)
   def ins(self, arg, **kwargs): return UOp(Ops.INS, kwargs.pop("src", self.src), (arg, kwargs.pop("dtype", self.dtype)), kwargs.pop("tag", self.tag))
   def contract(self, *rngs:UOp):
-    assert all(x.arg[-1] == AxisType.UPCAST for x in rngs), "all contract ranges must be upcast"
+    assert all(x.axis_type == AxisType.UPCAST for x in rngs), "all contract ranges must be upcast"
     return UOp.stack(*[self.substitute(dict(zip(rngs, [r.const_like(i) for r,i in zip(rngs, idx)])))
                            for idx in itertools.product(*[range(int(r.vmax)+1) for r in rngs])])
   def alu(self, op, *src:UOp, **kwargs): return UOp(op, src=(self, *src), **kwargs)
@@ -622,10 +641,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   @staticmethod
   def cconst(b:ConstLike, dtype:DType): return UOp(Ops.CAST, src=(UOp.const(b),), arg=dtype)
   @staticmethod
-  def range(end:sint, axis_id, axis_type=AxisType.WEAK, *arg, dtype=dtypes.weakint, src=(), **kwargs):
-    return UOp(Ops.RANGE, src=(sint_to_uop(end, dtype),)+src, arg=(axis_id, axis_type)+arg, **kwargs)
+  def range(end:sint, axis_id, axis_type=AxisType.WEAK, *, dtype=dtypes.weakint, src=(), **kwargs):
+    return UOp(Ops.RANGE, src=(sint_to_uop(end, dtype),)+src, arg=(axis_id, axis_type), **kwargs)
   @staticmethod
-  def loop(axis_id:int, *arg): return UOp(Ops.RANGE, src=(UOp(Ops.NOOP),), arg=(axis_id, AxisType.WEAK)+arg)
+  def loop(axis_id:int): return UOp(Ops.RANGE, src=(UOp(Ops.NOOP),), arg=(axis_id, AxisType.WEAK))
   @staticmethod
   def special(end:sint, name:str): return UOp(Ops.SPECIAL, src=(sint_to_uop(end),), arg=name)
   @staticmethod
@@ -1023,7 +1042,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return graph_rewrite(self, pm_unbind, ctx=ret), ret
   def variables(self) -> list[Variable]:
     return sorted({x if x.op in {Ops.PARAM, Ops.BUFFER} else UOp.variable("_device_num", 0, x.vmax, dtype=x.dtype, param=True)
-                   for x in self.backward_slice_with_self if (x.op is Ops.RANGE and x.arg[-1] is AxisType.DEVICE) or
+                   for x in self.backward_slice_with_self if (x.op is Ops.RANGE and x.axis_type is AxisType.DEVICE) or
                    (x.op is Ops.PARAM and x.arg.addrspace is AddrSpace.ALU) or x.is_variable}, key=lambda v: v.expr)
 
   # *** uop symbolic stuff ***
@@ -1222,7 +1241,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     creates ALLOCs: use call_with_outputs for calls that produce values"""
     assert self.op in OPAQUE_CALL_BODIES, f"cannot call a {self.op} body, use call_with_outputs for value-producing bodies"
     # calls are launched per device, so an open DEVICE range is allowed to cross the call boundary
-    assert all(r.arg[-1] is AxisType.DEVICE for r in self.ranges), \
+    assert all(r.axis_type is AxisType.DEVICE for r in self.ranges), \
       f"ranges {self.ranges} are leaking out of the call in {self.pyrender()}"
     # the (possibly void) return dtype lives in the CallInfo; an external C call is a CALL on a CUSTOM_FUNCTION
     # body holding the callee (a function pointer), rendered as an indirect call
@@ -1475,6 +1494,7 @@ class UPat(RandMixin):
   def broadcast(self, **kwargs): return UPat(Ops.STACK, self.match_dtype, src=self, **kwargs)
   def after(self, *src:UPat, **kwargs): return UPat(Ops.AFTER, self.match_dtype, (self,)+src, **kwargs)
   def end(self, *src:UPat, **kwargs): return UPat(Ops.END, src=(self,)+src, **kwargs)
+  def backedge(self, loop:UPat, cond:UPat, **kwargs): return UPat(Ops.BACKEDGE, src=(self, loop, cond), **kwargs)
 
   def _broadcasted(self, y, reverse=False) -> tuple[UPat, UPat]:
     y = self.ufix(y)
@@ -1852,12 +1872,16 @@ def do_unbind(ctx:dict[Variable, int], x:UOp):
   return v
 pm_unbind = PatternMatcher([(UPat(Ops.AFTER, name="x"), lambda ctx,x: do_unbind(ctx,x) if x.is_bound_var else None)])
 
+def contiguous_bitcast_index(ctx:UOp, b:UOp, idx:UOp):
+  if len(idx.src)-1 != len(b.shape): return None
+  offset = (sum(i*s for i,s in zip(idx.src[1:], strides_for_shape(b.shape))) - UOp.range(ctx.numel(), 0)).ssimplify()
+  osz, isz = b.element_size(), b.src[0].element_size()
+  if not isinstance(offset, int) or (offset*osz) % isz or (ctx.numel()*osz) % isz: return None
+  return b.src[0].flatten().index(UOp.range(ctx.numel()*osz//isz, 0) + offset*osz//isz)
+
 # ctx is source UOp for which we are finding a contiguous view for. used in contiguous_view_offset
 pm_contiguous_view_offset = PatternMatcher([
-  # normalize to 1d bitcasts
-  (UPat(Ops.BITCAST, name="b"), lambda b: b.src[0].flatten().bitcast(b.dtype).reshape(b.shape) if len(b.shape) != 1 else None),
-  (UPat(Ops.BITCAST, name="b").index(UPat.cvar("c")), lambda ctx, b, c:
-   b.src[0].flatten().index(UOp.range(ctx.numel() * (osz:=b.element_size())//(isz:=b.src[0].element_size()), 0) + (c * osz//isz)) if b.tag else None),
+  (UPat(Ops.BITCAST, name="b").f(Ops.INDEX, name="idx", allow_any_len=True), contiguous_bitcast_index),
   (UPat(Ops.INDEX, src=(UPat.var("b"),)), lambda b: b.rtag().index(0)),
   (UPat(Ops.INDEX, src=(UPat.var("b"), UPat(Ops.RANGE))), lambda b: b.rtag().index(0)),
   (UPat(Ops.INDEX, src=(UPat.var("b"), UPat(Ops.RANGE)+UPat.cvar('c'))), lambda ctx, b, c: b.rtag().index(c)),

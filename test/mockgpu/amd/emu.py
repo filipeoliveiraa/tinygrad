@@ -321,10 +321,10 @@ def _int_clamp(op_name: str, srcs: dict) -> UOp | None:
 class _Ctx:
   """Context for instruction compilation - holds buffers and helpers."""
   __slots__ = ('inst_size', 'dyn_fields', '_axis_id', 'wave_size', 'vgpr', 'accvgpr')
-  sgpr = UOp.param(0, dtypes.uint32, SGPR_COUNT)
-  vmem = UOp.param(2, dtypes.uint32, 1 << 46)
-  lds = UOp.param(3, dtypes.uint32, 16384)
-  scratch = UOp.param(4, dtypes.uint8, 1 << 30)
+  sgpr = UOp.param(0, dtypes.uint32, SGPR_COUNT, name="sgpr")
+  vmem = UOp.param(2, dtypes.uint32, 1 << 46, name="vmem")
+  lds = UOp.param(3, dtypes.uint32, 16384, name="lds")
+  scratch = UOp.param(4, dtypes.uint8, 1 << 30, name="scratch")
   # Cache PARAM UOps by wave_size so all _Ctx instances with same wave_size share identical UOp references
   _vgpr_cache: dict[int, UOp] = {}
   _accvgpr_cache: dict[int, UOp] = {}
@@ -332,10 +332,10 @@ class _Ctx:
   def __init__(self, inst_size: int, wave_size: int = 32):
     self.inst_size, self._axis_id, self.wave_size = inst_size, 0, wave_size
     self.dyn_fields: list[tuple[int, int]] = []  # (lo, hi) of fields read dynamically
-    if wave_size not in _Ctx._vgpr_cache: _Ctx._vgpr_cache[wave_size] = UOp.param(1, dtypes.uint32, 256 * wave_size)
+    if wave_size not in _Ctx._vgpr_cache: _Ctx._vgpr_cache[wave_size] = UOp.param(1, dtypes.uint32, 256 * wave_size, name="vgpr")
     self.vgpr = _Ctx._vgpr_cache[wave_size]
     if wave_size == 64:
-      if wave_size not in _Ctx._accvgpr_cache: _Ctx._accvgpr_cache[wave_size] = UOp.param(5, dtypes.uint32, 256 * wave_size)
+      if wave_size not in _Ctx._accvgpr_cache: _Ctx._accvgpr_cache[wave_size] = UOp.param(5, dtypes.uint32, 256 * wave_size, name="accvgpr")
       self.accvgpr = _Ctx._accvgpr_cache[wave_size]
     else:
       self.accvgpr = self.vgpr
@@ -1839,8 +1839,8 @@ def _get_runner(inst_bytes: bytes, arch: str = "rdna3"):
   canonical_name = f"{_op_name(inst).lower()}_{base.to_bytes(size, 'little').hex()}"
   sink = sink.replace(arg=KernelInfo(name=canonical_name)).rtag(1)
 
-  # NOTE: renderer output is not reproducible because of _MXCSRContext. PROFILE=0 prevents emulator instruction runners from polluting profiling.
-  with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0, PROFILE=0):
+  # NOTE: renderer output is not reproducible because of _MXCSRContext.
+  with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0):
     prg = to_program(sink, Device['CPU'].renderer)
     runtime = get_runtime('CPU', prg)
   _canonical_runner_cache.append((type(inst), base, mask, size, (prg, runtime)))

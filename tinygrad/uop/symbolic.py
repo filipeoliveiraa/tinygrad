@@ -268,7 +268,7 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   # ALU/variable min==max -> CONST
   (UPat({Ops.CMPLT, Ops.CMPNE, Ops.FLOORDIV, Ops.FLOORMOD, Ops.PARAM, Ops.AFTER, Ops.SPECIAL}, name="x"),
    lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
-  (UPat(Ops.RANGE, src=(UPat(Ops.CONST,)), name="x"), lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
+  (UPat(Ops.RANGE, src=(UPat.cvar().or_casted(),), name="x"), lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
   # max folding
   ((UPat.cvar("a") < UPat.var("b")).where(UPat.var("b"), UPat.cvar("c")), lambda a,b,c: UOp.maximum(a,b) if a.val == c.val else None),
   ((UPat.var("a") < UPat.cvar("b")).where(UPat.cvar("c"), UPat.var("a")), lambda a,b,c: UOp.maximum(a,b) if b.val == c.val else None),
@@ -314,12 +314,12 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   ((UPat.var("x", dtypes.weakint) + UPat.cvar("c")).cast(dtypes.sints, name="cast"), lambda x,c,cast:x.cast(cast.dtype)+cast.const_like(c.val)),
   # only RANGE/IF/STORE/KERNEL have side effects
   (UPat(Ops.AFTER, name="x"), lambda x: x.replace(src=(x.src[0],)+
-    tuple(dedup(flatten([(y,) if y.op in {Ops.RANGE, Ops.STORE, Ops.CALL, Ops.BARRIER, Ops.END, Ops.LINEAR, Ops.STAGE}
+    tuple(dedup(flatten([(y,) if y.op in {Ops.RANGE, Ops.STORE, Ops.CALL, Ops.BARRIER, Ops.END, Ops.BACKEDGE, Ops.LINEAR, Ops.STAGE}
                         else y.src for y in x.src[1:]]))))),
   # after/end with 1 src is just src[0]
   (UPat((Ops.AFTER, Ops.END), src=(UPat.var("s"),)), lambda s: s),
-  # ranges can be subbed for CONSTs, remove them from ENDs while preserving a constant bool backedge
-  (UPat(Ops.END, name="x"), lambda x: x.replace(src=(x.src[0],)+tuple(r for r in x.src[1:] if r.op is not Ops.CONST or r.dtype is dtypes.bool))),
+  # ranges can be subbed for CONSTs, remove them from ENDs. BACKEDGE conditions are never range selectors.
+  (UPat(Ops.END, name="x"), lambda x: x.replace(src=(x.src[0],)+tuple(r for r in x.src[1:] if r.op is not Ops.CONST))),
   # the rules above key on bare CONSTs, so a redundantly committed const has to be uncast in the same fixpoint
 ])+div_and_mod_symbolic+pm_uncast_const
 

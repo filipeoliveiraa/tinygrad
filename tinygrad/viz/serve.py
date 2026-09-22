@@ -54,7 +54,7 @@ uops_colors = {Ops.LOAD: "#ffc0c0", Ops.STORE: "#87CEEB", Ops.CONST: "#e0e0e0", 
                Ops.CALL: "#00B7C8", Ops.PARAM: "#14686F", Ops.SOURCE: "#c0c0c0", Ops.BINARY: "#404040",
                Ops.LINEAR: "#7DF4FF", Ops.ALLOC: "#C07788",
                Ops.ALLREDUCE: "#ff40a0", Ops.MSELECT: "#d040a0", Ops.MSTACK: "#d040a0",
-               Ops.STAGE: "#FFC14D", Ops.REWRITE_ERROR: "#1a1b26", Ops.AFTER: "#8A7866", Ops.END: "#524C46"}
+               Ops.STAGE: "#FFC14D", Ops.REWRITE_ERROR: "#1a1b26", Ops.AFTER: "#8A7866", Ops.END: "#524C46", Ops.BACKEDGE: "#464752"}
 
 addrspace_colors = {AddrSpace.ALU: "#AAAAAA", AddrSpace.REG:"#e68181", AddrSpace.LOCAL:"#e7c86a", AddrSpace.GLOBAL:"#75bd7b"}
 
@@ -152,7 +152,8 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
         ranges: list[UOp] = []
         for us in u.src[1:]: ranges += [s for s in us.toposort() if s.op in {Ops.RANGE, Ops.SPECIAL}]
         if ranges: label += "\n"+' '.join([f"{s.render()}={s.vmax+1}" for s in ranges])
-      if u.op in {Ops.END, Ops.REDUCE} and len(trngs:=list(UOp.sink(*u.src[range_start[u.op]:]).ranges)):
+      if u.op in {Ops.END, Ops.REDUCE, Ops.BACKEDGE} and len(trngs:=list(u.ended_ranges if u.op is Ops.BACKEDGE else
+                                                                 UOp.sink(*u.src[range_start[u.op]:]).ranges)):
         label += "\n"+' '.join([f"{range_str(s, color=True)}({s.vmax+1})" for s in trngs])
     except Exception:
       label += "\n<ISSUE GETTING LABEL>"
@@ -196,9 +197,11 @@ def get_full_rewrite(data:VizData, ctx:TrackedGraphRewrite, depth:int|None=None,
            "diff":list(difflib.unified_diff(pystr(u0).splitlines(), pystr(u1).splitlines())), "upat":(upat_loc, match_repr), "_sink":new_sink}
     if not ctx.bottom_up: next_sink = new_sink
 
-def get_sink_at(upats:tuple[str, ...], viz_data:VizData, kernel_idx:int, lin_idx:int, depth:int|None=None) -> UOp|None:
-  for s in get_full_rewrite(viz_data, ctx:=viz_data.trace.rewrites[kernel_idx][lin_idx], depth=depth):
-    if (s["upat"] is not None and any(n in s["upat"][1] for n in upats)) or len(ctx.matches) == 0: return s["_sink"]
+def get_sink_at(upats:tuple[str, ...], viz_data:VizData, kernel_idx:int, lin_idx:int, depth:int|None=None, alt:str|None=None) -> UOp|None:
+  for i in range(lin_idx+1, len(rewrites:=viz_data.trace.rewrites[kernel_idx])):
+    if (r:=rewrites[i]).name == alt: return _reconstruct(viz_data, r.sink, depth=depth)
+  for s in get_full_rewrite(viz_data, rewrites[lin_idx], depth=depth):
+    if (s["upat"] is not None and any(n in s["upat"][1] for n in upats)): return s["_sink"]
   return None
 
 # encoder helpers
@@ -641,15 +644,15 @@ def get_render(viz_data:VizData, query:str, **kwargs) -> dict:
   data = viz_data.ctxs[i]["steps"][j]["_data"]
   if fmt == "graph-rewrites": return {"value":get_full_rewrite(viz_data, viz_data.trace.rewrites[i][j], **kwargs), "content_type":"text/event-stream"}
   if fmt == "uops":
-    if (sink:=get_sink_at(("do_linearize",), viz_data, i, data)) is None: return {"src":"No linear found"}
+    if (sink:=get_sink_at(("do_linearize",), viz_data, i, data, alt="View Program")) is None: return {"src":"No linear found"}
     return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":get_stdout(lambda: print_uops(list(unwrap(sink).src[1].src)))}
   if fmt == "code":
-    if (sink:=get_sink_at(("do_render",), viz_data, i, data, depth=1)) is None: return {"src":"No source found"}
+    if (sink:=get_sink_at(("do_render",), viz_data, i, data, depth=1, alt="View Program")) is None: return {"src":"No source found"}
     return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":sink.src[2].arg, "lang":"cpp"}
   if fmt == "asm":
     ret:dict = {}
     renderer, idx = data
-    if (sink:=get_sink_at(("do_compile","do_assemble"), viz_data, i, idx, depth=1)) is None: return {"src":"No binary found"}
+    if (sink:=get_sink_at(("do_compile","do_assemble"), viz_data, i, idx, depth=1, alt="View Program")) is None: return {"src":"No binary found"}
     if sink.op is Ops.REWRITE_ERROR: return {"src":sink.arg}
     lib:bytes = sink.src[3].arg
     if renderer.target.arch.startswith("gfx"):

@@ -400,7 +400,7 @@ if getenv("DEBUG_GC"):
 cache_dir: str = os.path.join(getenv("XDG_CACHE_HOME", os.path.expanduser("~/Library/Caches" if OSX else "~/.cache")), "tinygrad")
 CACHEDB: str = getenv("CACHEDB", os.path.abspath(os.path.join(cache_dir, "cache.db")))
 
-VERSION = 23
+VERSION = 24
 _db_connection = threading.local()
 def db_connection():
   if (conn:=getattr(_db_connection, "conn", None)) is None:
@@ -528,9 +528,10 @@ def system(cmd:str, **kwargs) -> str:
   return ret
 
 def cpu_objdump(lib, objdump_tool='objdump'):
-  with tempfile.NamedTemporaryFile(delete=True) as f:
-    pathlib.Path(f.name).write_bytes(lib)
-    print(system(f"{objdump_tool} -d {f.name}"))
+  with tempfile.TemporaryDirectory() as tmpdir:
+    path = pathlib.Path(tmpdir) / "kernel.o"
+    path.write_bytes(lib)
+    print(system(f"{objdump_tool} -d {path}"))
 
 def capstone_flatdump(lib: bytes, arch:str):
   try: import capstone

@@ -14,7 +14,7 @@ base_rewrite = PatternMatcher([
   (UPat(Ops.BINARY, name="x"), lambda ctx,x: f'const unsigned char {ctx[x]}[] = "' + ''.join(f'\\x{b:02x}' for b in x.arg) + '";'),
 
   # range/loop/if/endif
-  (UPat(Ops.RANGE, dtypes.void, name="x"), lambda ctx,x: "for (;;) {"),
+  (UPat(Ops.RANGE, dtypes.void), lambda ctx: "for (;;) {"),
   (UPat(Ops.RANGE, name="x"),
    lambda ctx,x: f"for ({ctx.render_dtype(x.dtype)} {ctx[x]} = 0; {ctx[x]} < {ctx[x.src[0]]}; {ctx[x]}++) {{"),
   (UPat(Ops.BACKEDGE, src=(UPat(), UPat(Ops.RANGE), UPat(name="c", dtype=dtypes.bool))), lambda ctx,c: f"  if (!({ctx[c]})) {{ break; }}\n}}"),
@@ -222,6 +222,8 @@ class CStyleLanguage(Renderer):
       if u.op in {Ops.NOOP, Ops.GROUP, Ops.CONST, Ops.CUSTOM_FUNCTION}: continue
       if u.op == Ops.STACK and len(u.src) == 0: continue
       if u.op is Ops.AFTER:
+        # the AFTER-wrapped NOOP bound of a void RANGE is never rendered
+        if u.src[0].op is Ops.NOOP: continue
         r[u] = r[u.src[0]]
         continue
       if u.op is Ops.SINK:
@@ -490,7 +492,8 @@ class NVCCRenderer(CUDARenderer):
   def __init__(self, target:Target): super().__init__(target, use_nvcc=True)
 
 def fp8_index(dtype: DType): return dtypes.fp8s.index(dtype) % 2
-def amd_fp8s(arch:str): return {"gfx942": dtypes.fp8_fnuz, "gfx950": dtypes.fp8_ocp}.get(arch, ())
+def amd_fp8s(arch:str):
+  return {"gfx942": dtypes.fp8_fnuz, "gfx950": dtypes.fp8_ocp, "gfx1200": dtypes.fp8_ocp, "gfx1201": dtypes.fp8_ocp}.get(arch, ())
 def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
 
 class HIPRenderer(CStyleLanguage):
@@ -513,6 +516,10 @@ class HIPRenderer(CStyleLanguage):
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
           f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[0][2] == 128 else None),
         (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
+      ]) + self.string_rewrite
+    if amd_fp8s(target.arch):
+      self.extra_matcher += tc.pm_wmma_fp8(dtypes.uint64 if self.is_cdna(target.arch) else dtypes.uint32)
+      self.string_rewrite = PatternMatcher([
         (UPat.cvar("c").cast(dtypes.fp8s, name="x"), lambda ctx,x,c:
           f"f32_to_fp8({ctx.nan if math.isnan(v:=c.val) else ctx.infinity if v == math.inf else f'-{ctx.infinity}' if v == -math.inf else f'{v}f'},"
           f" {fp8_index(x.dtype)})"),
@@ -520,7 +527,7 @@ class HIPRenderer(CStyleLanguage):
           lambda ctx,x: f"f32_to_fp8({ctx[x.src[0]]}, {fp8_index(x.dtype)})"),
         (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",),
           lambda ctx,x,y: f"__builtin_amdgcn_cvt_f32_{('fp8', 'bf8')[fp8_index(y.dtype)]}((unsigned int){ctx[x.src[0]]}, 0)"),
-      ]) + base_rewrite
+      ]) + self.string_rewrite
     # a LOAD flagged nontemporal renders as the cache-bypassing builtin (only used on global loads)
     self.string_rewrite = PatternMatcher([(UPat(Ops.LOAD, arg="nontemporal", src=(UPat.var("bidx"),)),
       lambda ctx,bidx: f"__builtin_nontemporal_load({ctx.render_ptr(bidx)})")]) + self.string_rewrite
@@ -538,11 +545,7 @@ class HIPRenderer(CStyleLanguage):
             '__builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");'
   float4 = "make_float4"
   type_map = {**CStyleLanguage.type_map, dtypes.bf16: "hip_bfloat16", **{d: ("hip_fp8", "hip_bf8")[fp8_index(d)] for d in dtypes.fp8s}}
-  extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s)) + PatternMatcher([
-    (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
-      lambda x: x.replace(src=(x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64), x.src[2]))
-      if x.src[0].max_numel() == 8 and x.src[0].dtype in dtypes.fp8s else None),
-  ])
+  extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s))
 
   def asm(self, prg:UOp, lin:UOp) -> bytes:
     from tinygrad.renderer.amd.elf import assemble_linear
@@ -555,7 +558,8 @@ class HIPRenderer(CStyleLanguage):
 
   def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
     prefix, ockl = [], []
-    type_map = {dtypes.bf16: "bf16", dtypes.f32: "f32", dtypes.f16: "f16", **{d: ("_fp8_fp8", "_bf8_bf8")[fp8_index(d)] for d in dtypes.fp8s}}
+    type_map = {dtypes.bf16: "bf16", dtypes.f32: "f32", dtypes.f16: "f16",
+                **{d: ("_" if self.is_cdna(self.target.arch) else "") + ("fp8_fp8", "bf8_bf8")[fp8_index(d)] for d in dtypes.fp8s}}
     used_dtypes = uops_to_dtypes(uops)
     if any(u.op is Ops.CAST and u.src[0].op is Ops.CONST and not math.isfinite(u.src[0].val) for u in uops):
       prefix += ["#define INFINITY (__builtin_inff())", "#define NAN (__builtin_nanf(\"\"))"]

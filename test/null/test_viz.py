@@ -455,16 +455,9 @@ class TestVizIntegration(unittest.TestCase):
       a, b, c = Tensor.empty(16, device="NULL"), Tensor.empty(16, device="NULL"), Tensor.empty(16, device="NULL:1")
       for _ in range(3): Tensor.realize(*f(a, b, c))
     out = load_profile(cpu_events)
-    self.assertEqual(["NULL", "NULL Graph", "NULL:SDMA:0", "NULL:1", "NULL:1:SDMA:0"], [k for k in out["layout"] if k.startswith("NULL")])
+    self.assertEqual(["NULL", "NULL:SDMA:0", "NULL:1", "NULL:1:SDMA:0"], [k for k in out["layout"] if k.startswith("NULL")])
     self.assertEqual(len(out["layout"]["NULL"]["events"]), 2*3)
     self.assertEqual(len(out["layout"]["NULL:SDMA:0"]["events"]), 3)
-    self.assertEqual(len(out["layout"]["NULL Graph"]["events"]), 3)
-    for graph in out["layout"]["NULL Graph"]["events"]:
-      graph_st, graph_et = graph["st"], graph["st"]+graph["dur"]
-      for k in ["NULL", "NULL:1", "NULL:SDMA:0", "NULL:1:SDMA:0"]:
-        events = [e for e in out["layout"][k]["events"] if graph_st <= e["st"] and e["st"]+e["dur"] <= graph_et]
-        self.assertGreater(len(events), 0)
-        self.assertEqual([e["st"] for e in events], [graph_st+i*events[0]["dur"] for i in range(len(events))])
 
   @needs_tracked_pm
   def test_view_source(self):
@@ -637,15 +630,13 @@ class TestVizProfiler(unittest.TestCase):
             ProfileDeviceEvent(device='NV:1:SDMA:0', tdiff=decimal.Decimal(-50)),
             ProfileGraphEvent(ents=[ProfileGraphEntry(device='NV', name='E_25_4n2', st_id=0, en_id=1),
                                     ProfileGraphEntry(device='NV:1:SDMA:0', name='NV -> NV:1', st_id=2, en_id=3)],
-                              deps=[[], [0]],
                               sigs=[decimal.Decimal(1000), decimal.Decimal(1002), decimal.Decimal(1004), decimal.Decimal(1008)])]
 
     j = load_profile(prof)
 
     tracks = list(j['layout'])
     self.assertEqual(tracks[0], 'NV')
-    self.assertEqual(tracks[1], 'NV Graph')
-    self.assertEqual(tracks[2], 'NV:1:SDMA:0')
+    self.assertEqual(tracks[1], 'NV:1:SDMA:0')
 
     nv_events = j['layout']['NV']['events']
     self.assertEqual(nv_events[0]['name'], 'E_25_4n2')
@@ -656,17 +647,12 @@ class TestVizProfiler(unittest.TestCase):
     self.assertEqual(sdma_events[0]['name'], 'NV -> NV:1')
     self.assertEqual(sdma_events[0]['st'], 954)
 
-    graph_events = j['layout']['NV Graph']['events']
-    self.assertEqual(graph_events[0]['st'], nv_events[0]['st'])
-    self.assertEqual(graph_events[0]['st']+graph_events[0]['dur'], sdma_events[0]['st']+sdma_events[0]['dur'])
-
   def test_graph_copy_bandwidth(self):
     sz = 256*1024*1024
     dur = 10_000
     prof = [ProfileDeviceEvent(device='NV', tdiff=decimal.Decimal(-1000)),
             ProfileDeviceEvent(device='NV:1:SDMA:0', tdiff=decimal.Decimal(-50)),
             ProfileGraphEvent(ents=[ProfileGraphEntry(device='NV:1:SDMA:0', name=TracingKey("NV -> NV:1", ret=sz), st_id=0, en_id=1)],
-                              deps=[[]],
                               sigs=[decimal.Decimal(1004), decimal.Decimal(1004+dur)])]
 
     j = load_profile(prof)
@@ -681,10 +667,10 @@ class TestVizProfiler(unittest.TestCase):
             ProfileRangeEvent(device='NV:1', name='E_3', st=decimal.Decimal(1000), en=decimal.Decimal(1010)),
             ProfileRangeEvent(device='NV:SDMA:0', name='COPY', st=decimal.Decimal(1000), en=decimal.Decimal(1010)),
             ProfileGraphEvent(ents=[ProfileGraphEntry(device='NV', name='E_2', st_id=0, en_id=1)],
-                              deps=[[]], sigs=[decimal.Decimal(1000), decimal.Decimal(1010)])]
+                              sigs=[decimal.Decimal(1000), decimal.Decimal(1010)])]
     j = load_profile(prof)
-    # graph grouped with its device, memory at the end
-    self.assertListEqual(list(j['layout']), ['NV', 'NV Graph', 'NV:SDMA:0', 'NV:1'])
+    # memory at the end
+    self.assertListEqual(list(j['layout']), ['NV', 'NV:SDMA:0', 'NV:1'])
 
   def test_multi_sdma_ordering(self):
     props = {"gfx_target_version": 0}
@@ -706,14 +692,14 @@ class TestVizProfiler(unittest.TestCase):
             # graph spanning compute + copy on GPU 0
             ProfileGraphEvent(ents=[ProfileGraphEntry(device='AMD', name='E_1', st_id=0, en_id=1),
                                     ProfileGraphEntry(device='AMD:SDMA:0', name='COPY0', st_id=2, en_id=3)],
-                              deps=[[], [0]], sigs=[St, En, St, En]),
+                              sigs=[St, En, St, En]),
             # memory alloc on both GPUs
             ProfilePointEvent(device='AMD', name='alloc', key=0, arg={"nbytes":4096}, ts=St),
             ProfilePointEvent(device='AMD:1', name='alloc', key=1, arg={"nbytes":2048}, ts=St)]
     j = load_profile(prof)
-    # graph grouped with its device, memory at the end
+    # memory at the end
     self.assertListEqual(list(j['layout']),
-      ['AMD', 'AMD Graph', 'AMD:SDMA:0', 'AMD:SDMA:1',
+      ['AMD', 'AMD:SDMA:0', 'AMD:SDMA:1',
        'AMD:1', 'AMD:1:SDMA:0', 'AMD:1:SDMA:1',
        'AMD Memory', 'AMD:1 Memory'])
 

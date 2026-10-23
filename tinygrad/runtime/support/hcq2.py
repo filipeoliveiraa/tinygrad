@@ -237,7 +237,7 @@ def _wait_ins(ctx:BatchCtx, waits:dict[tuple[str, str], int]) -> list[UOp]:
   return [ins("wait", ctx.queue_signal(d, q), UOp.const(t + 1, dtypes.u64)) for (d, q), t in waits.items()]
 
 def _start_ins(ctx:BatchCtx, dev:str, queue:str) -> list[UOp]:
-  return [ins("memory_barrier")] + [ins("wait", timeline(d), timeline_value(d)) for d in [dev, *sorted(ctx.peers.get((dev, queue), ()))]]
+  return [ins("wait", timeline(d), timeline_value(d)) for d in [dev, *sorted(ctx.peers.get((dev, queue), ()))]] + [ins("memory_barrier")]
 
 def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
   queue_of = [(dev, queue) for _, dev, queue in ctx.batch] # the (device, queue) of each call by tag
@@ -278,7 +278,7 @@ def _build_queues(ctx:BatchCtx) -> dict[tuple[str, str], list[UOp]]:
     barrier = [ins("exec_barrier")] if tag in barriers else []
     stamps = [ins("timestamp", ctx.slot(dev, i)) for i in ctx.stamps(dev, tag)]
     signal = [ins("store", ctx.queue_signal(dev, queue), UOp.const(tag + 1, dtypes.u64))] if tag in signal_tags else []
-    return barrier + _wait_ins(ctx, call_waits[tag]) + stamps[:1] + [call] + stamps[1:] + signal
+    return barrier + _wait_ins(ctx, call_waits[tag]) + [ins("memory_barrier")] * bool(call_waits[tag]) + stamps[:1] + [call] + stamps[1:] + signal
 
   # closers advance device timelines
   close_cmds = {dev: _wait_ins(ctx, close_waits[dev]) + [ins("store", timeline(dev), timeline_value(dev) + 1)] for dev in ctx.queues}
@@ -405,7 +405,7 @@ def encode_cmdbuf(hq:HWQueue, lin:UOp|None=None, name:str="cmdbuf", device:str|t
   dwords = [(UOp(Ops.BINARY, arg=struct.pack(f"<{len(at)}I", *at)).bitcast(dtypes.u32).index(r).load() + 4 * k, (w >> 32 * k).cast(dtypes.u32))
             for w, (at, r) in looped.items() for k in range(w.dtype.itemsize // 4)]
   patches = [(o, w) for o, w in hq.patches if w not in looped] + dwords
-  nested = dedup([g.src[0] for _, w in patches for g in w.toposort() if g.op is Ops.GETADDR and g.src[0].op is Ops.LINEAR])
+  nested = dedup([g.src[0] for g in UOp.sink(*[w for _, w in patches]).toposort() if g.op is Ops.GETADDR and g.src[0].op is Ops.LINEAR])
 
   # nested linears (like kernargs) merge into a buffer per name, patched before the stream
   bufs = []

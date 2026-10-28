@@ -139,12 +139,6 @@ devectorizer2 = pm_mops+PatternMatcher([
   (UPat(Ops.INDEX, src=(UPat.var('x'),)), lambda x: x),
   # unpack WMMA
   (UPat(Ops.WMMA, name="u"), do_stack_wmma),
-  # stacked INDEX is many INDEX
-  (UPat(Ops.INDEX, src=(UPat(GroupOp.Defines, name="b"), UPat(Ops.STACK, name="s")), name="x"),
-   lambda b,s,x: UOp.stack(*[x.replace(src=(b,u)) for u in s.src])),
-  # INDEX into RESHAPE moves the RESHAPE
-  (UPat(Ops.INDEX, src=(UPat(GroupOp.Defines, name="b"), UPat(Ops.RESHAPE, name="s"))),
-   lambda b,s: b.index(s.src[0]).reshape(s.shape)),
   # RESHAPE a void is removed (hack for AFTER)
   (UPat(Ops.RESHAPE, dtype=dtypes.void, name="x"), lambda x: x.src[0]),
   # reshape of a single element shaped value to scalar is an index
@@ -185,19 +179,18 @@ def merge_reduce_ends(sink:UOp):
       for e in group: subs[e] = merged
   return sink.substitute(subs) if subs else None
 
-def reduce_ranges_to_acc(ctx:itertools.count, r:UOp):
+def lower_reduce(ctx:itertools.count, r:UOp):
+  # horizontal: int, how many leading axes of inp are reduced in place, the rest of the reduce is over the ranges in src[1:]
+  inp, (op, horizontal) = r.src[0], r.arg
+  vals = [inp.index(*idx) for idx in itertools.product(*[range(inp.max_shape[a]) for a in range(horizontal)])] if horizontal else [inp]
+  ret = functools.reduce(lambda x,y: x.alu(op, y), vals)
+  if len(r.src) == 1: return ret
   acc = UOp.alloc_like(r, next(ctx), AddrSpace.REG)
-  input_ranges = tuple(x for x in r.src[0].ranges if x not in r.src[1:])
-  acc_init = acc.after(*input_ranges).store(UOp.const(identity_element(r.arg[0], r.dtype)))
+  input_ranges = tuple(x for x in inp.ranges if x not in r.src[1:])
+  acc_init = acc.after(*input_ranges).store(UOp.const(identity_element(op, r.dtype)))
   acc_initted = acc.after(acc_init, *r.src[1:])
-  inp = r.src[0].reduce(arg=r.arg) if r.arg[1] else r.src[0]
-  acc_out = acc_initted.store(acc_initted.alu(r.arg[0], inp)).end(*r.src[1:])
+  acc_out = acc_initted.store(acc_initted.alu(op, ret)).end(*r.src[1:])
   return acc.after(acc_out)
-
-def expand_horizontal_reduce(r:UOp):
-  inp = r.src[0]
-  vals = [inp.index(*idx) for idx in itertools.product(*[range(inp.max_shape[a]) for a in range(r.arg[1])])]
-  return functools.reduce(lambda x,y: x.alu(r.arg[0], y), vals)
 
 # an Invalid in a REDUCE source is that reduce's identity
 pm_reduce_identity = PatternMatcher([
@@ -209,15 +202,14 @@ pm_reduce_local = pm_wmma_add+PatternMatcher([
   # fix group for reduce
   (UPat(Ops.REDUCE, name="x"), fix_group_for_reduce),
   # remove reduces
-  (UPat(Ops.REDUCE, src=(UPat(), UPat()), allow_any_len=True, name="r"), reduce_ranges_to_acc),
-  (UPat(Ops.REDUCE, src=(UPat(),), name="r"), expand_horizontal_reduce),
+  (UPat(Ops.REDUCE, name="r"), lower_reduce),
   (UPat(Ops.SINK, name="sink"), merge_reduce_ends),
 ])+pm_clean_up_group_sink
 
 def is_shape_changing_bitcast(u:UOp): return u.op is Ops.BITCAST and u.shape != u.src[0].shape
 def maybe_load(u:UOp): return u.load() if u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL, AddrSpace.REG) else u
 pm_add_loads = PatternMatcher([
-  (UPat(GroupOp.Elementwise|{Ops.REDUCE,Ops.WMMA,Ops.STACK}, name="x"),
+  (UPat(GroupOp.Elementwise|{Ops.WMMA,Ops.STACK}, name="x"),
    lambda x: None if is_shape_changing_bitcast(x) else x.replace(src=tuple(map(maybe_load, x.src)))),
   (UPat(Ops.STORE, name="x"), lambda x: x.replace(src=(x.src[0], maybe_load(x.src[1]))+x.src[2:])),
 ])
@@ -417,15 +409,19 @@ class LowerCallsCtx:
   renderer: Renderer
   names: dict[str, dict[UOp, int]] = field(default_factory=dict)
 
-def lower_call(ctx:LowerCallsCtx, call:UOp) -> UOp|None:
-  if call.body.op is Ops.PROGRAM and call.body.src[-1].op is Ops.BINARY: return None
+def lower_call(ctx:LowerCallsCtx, call:UOp, b:UOp) -> UOp|None:
+  if b.op is Ops.PROGRAM and b.src[-1].op is Ops.BINARY: return None
   bodies = ctx.names.setdefault(name:=to_function_name(call.arg.name), {})
-  ki = KernelInfo(name + (f"_{i}" if (i:=bodies.setdefault(call.body, len(bodies))) else ""), optimized=True)
-  body = call.body.substitute({call.body.src[0]:call.body.src[0].replace(arg=ki)}) if call.body.op is Ops.PROGRAM else call.body.replace(arg=ki)
-  return call.replace(src=(to_program(body, ctx.renderer), *call.src[1:]))
+  ki = KernelInfo(name + (f"_{i}" if (i:=bodies.setdefault(b, len(bodies))) else ""), optimized=True)
+  if ctx.renderer.inline_prefix:
+    b = graph_rewrite(b, pm_lower_calls, ctx=ctx, name="lower calls", walk=True)
+    b = UOp(Ops.LINEAR, src=tuple(line_rewrite(list(b.src[1].src) if b.op is Ops.PROGRAM \
+        else linearize(full_rewrite_to_sink(b, ctx.renderer, optimize=False)), pm_linearize_cleanups+pm_alloc_to_buf)), arg=ki.name)
+  else: b = to_program(b.substitute({b.src[0]:b.src[0].replace(arg=ki)}) if b.op is Ops.PROGRAM else b.replace(arg=ki), ctx.renderer)
+  return call.replace(src=(b,)+call.src[1:])
 
 pm_lower_calls = PatternMatcher([
-  (UPat(Ops.CALL, src=(UPat((Ops.SINK, Ops.PROGRAM)),), allow_any_len=True, name="call"), lower_call),
+  (UPat(Ops.CALL, src=(UPat((Ops.SINK, Ops.PROGRAM), name="b"),), allow_any_len=True, name="call"), lower_call),
 ])
 
 def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:

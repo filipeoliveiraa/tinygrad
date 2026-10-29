@@ -1,7 +1,7 @@
 # all of symbolic lives here now
 import math
 from collections import defaultdict
-from tinygrad.uop.ops import Ops, PatternMatcher, UPat, UOp, GroupOp, exec_alu, promo_dtype
+from tinygrad.uop.ops import Ops, PatternMatcher, UPat, UOp, GroupOp, exec_alu, promo_dtype, identity_element
 from tinygrad.dtype import PyConst, ConstFloat, dtypes, can_lossless_cast, Invalid, bitcast, truncate
 from tinygrad.helpers import partition, all_same, prod, flatten, IMAGE, dedup, ceildiv
 from tinygrad.uop.divandmod import div_and_mod_symbolic
@@ -75,10 +75,13 @@ def const_arg(u:UOp):
 
 def lift_reduce_gate(red:UOp, cond:UOp, x:UOp, i:UOp) -> UOp|None:
   # a REDUCE moves inside the gate clauses without its ranges: they invalidate every lane at once, so that gate lifts out
-  if red.arg[1] != 0: return None
+  # the clauses with its ranges invalidate single lanes, an Invalid lane is the reduce's identity
+  op, horizontal = red.arg
+  if horizontal != 0: return None
   keep, lift = partition(cond.split_uop(Ops.AND), lambda c: any(rr in c.ranges for r in red.src[1:] for rr in r.ranges))
-  inner = keep[0].uprod(*keep[1:]).where(x, i) if keep else x
-  return lift[0].uprod(*lift[1:]).where(red.replace(src=(inner,)+red.src[1:]), i) if lift else None
+  inner = keep[0].uprod(*keep[1:]).where(x, x.const_like(identity_element(op, red.dtype))) if keep else x
+  ret = red.replace(src=(inner,)+red.src[1:])
+  return lift[0].uprod(*lift[1:]).where(ret, i) if lift else ret
 
 pm_data_invalid = PatternMatcher([
   (invalid_pat.broadcast(name="s"), lambda i,s: i.expand(s.shape)),
@@ -108,8 +111,7 @@ pm_data_invalid = PatternMatcher([
 
 pm_remove_invalid = PatternMatcher([
   (invalid_gate.named("w"), lambda cond,x,i,w: w.replace(src=(cond,x,w.const_like(0)))),
-  (UPat(Ops.STACK, name="s"), lambda s: s.replace(src=tuple(UOp.const(0, s.dtype) if x.is_invalid else x for x in s.src))
-   if any(x.is_invalid for x in s.src) else None),
+  (UPat(Ops.STACK, name="s"), lambda s: s.replace(src=tuple(UOp.const(0, s.dtype) if x.is_invalid else x for x in s.src))),
 ])
 
 def fold_const_where(gate:UOp, c0:UOp, c1:UOp, w:UOp) -> UOp:
@@ -148,8 +150,6 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
   # (x&mask)>>k -> x>>k when mask only clears bits below k
   ((UPat.var("x") & UPat.cvar("mask")) >> UPat.cvar("k"),
    lambda x,mask,k: x >> k.val if x.dtype.const(mask.val | ((1 << k.val) - 1)) == x.dtype.const(-1) else None),
-  ((UPat.var("x") & UPat.cvar("mask")) // UPat.cvar("c"),
-   lambda x,mask,c: x // c.val if c.val > 0 and c.val & (c.val-1) == 0 and x.dtype.const(mask.val | (c.val-1)) == x.dtype.const(-1) else None),
   (UPat.var("x", dtype=dtypes.ints+(dtypes.bool, dtypes.weakint)).eq(UPat.var("x")),
    lambda x: x.const_like(True, dtypes.bool)), # x == x -> True (only ints)
   # ** constant folding **
@@ -196,7 +196,7 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
   (UPat.var("x").alu(Ops.POW, UPat.cvar("c")), simplify_pow),
   # positive const ** x
   (UPat.cvar("c").alu(Ops.POW, UPat.var("x")),
-   lambda c,x: c if c.val == 1 else (x*math.log2(c.val)).exp2() if c.val > 0 and dtypes.is_float(x.dtype) else None),
+   lambda c,x: (x*math.log2(c.val)).exp2() if c.val > 0 and dtypes.is_float(x.dtype) else None),
   # unpack a uint64 packed from two uint32 (threefry)
   (((UPat.var(None, dtypes.uint64)<<32) | UPat.var('y', dtypes.uint32).cast(dtypes.uint64)).cast(dtypes.uint32), lambda y: y),
   (((UPat.var('x', dtypes.uint64)<<32) | UPat.var(None, dtypes.uint32).cast(dtypes.uint64))>>32,
@@ -284,8 +284,10 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   (UPat(Ops.RANGE, src=(UPat.cvar().or_casted(),), name="x"), lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
   # max folding
   ((UPat.cvar("a") < UPat.var("b")).where(UPat.var("b"), UPat.cvar("c")), lambda a,b,c: UOp.maximum(a,b) if a.val == c.val else None),
-  ((UPat.var("a") < UPat.cvar("b")).where(UPat.cvar("c"), UPat.var("a")), lambda a,b,c: UOp.maximum(a,b) if b.val == c.val else None),
-  (UPat.maximum(UPat.var("x"), UPat.var("y")), lambda x,y: x if x.vmin >= y.vmax else y if x.vmax <= y.vmin else None),
+  # (a<b).where(c, a+(c-b)) -> max(a+(c-b), c), the shift needs a signed int so the unselected arm can't wrap
+  ((UPat.var("a") < UPat.cvar("b")).where(UPat.cvar("c"), UPat.var("y")), lambda a,b,c,y: UOp.maximum(y,c) if (y is a and b.val == c.val) or
+   (dtypes.is_int(a.dtype) and not dtypes.is_unsigned(a.dtype) and y is a+(c.val-b.val)) else None),
+  (UPat.maximum(UPat.var("x"), UPat.var("y")), lambda x,y: x if x.vmin >= y.vmax else None),
   # TODO: why does this rule break beautiful_mnist?
   #((UPat.var("x")+UPat.var("z")).maximum(UPat.var("y")+UPat.var("z")), lambda x,y,z: x.maximum(y) + z),
   # (x//c1)//c2 -> x//(c1*c2) for c2>0 when c1*c2 fits
@@ -295,9 +297,9 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   # c0+x<c1 -> x < c1-c0
   ((UPat.cvar("c0") + UPat.var("x", dtype=dtypes.sints+(dtypes.weakint,))) < UPat.cvar("c1"),
    lambda x,c0,c1: x<(c1-c0) if fits(x, c1.vmin-c0.vmin) else None),
-  # x//d<c -> x<c*d for d>0, and -> c*d<x for d<0
+  # x//d<c -> x<c*d for d>0
   ((UPat.var("x", dtype=dtypes.weakint)//UPat.cvar("d"))<UPat.cvar("c"),
-   lambda x,d,c: (x<c.val*d.val) if d.val > 0 else (x>c.val*d.val) if d.val < 0 else None),
+   lambda x,d,c: (x<c.val*d.val) if d.val > 0 else None),
   # ** move add/mul consts to end (NOTE: this is still happening before constant folding) **
   ((UPat.var("x") + UPat.cvar("c1")) + UPat.var("y"), lambda x,c1,y: (x+y)+c1 if y.op is not Ops.CONST else None),
   ((UPat.var("x") * UPat.cvar("c1")) * UPat.var("y"), lambda x,c1,y: (x*y)*c1 if y.op is not Ops.CONST else None),
@@ -325,11 +327,9 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   # an AFTER waits only on the effect ops listed here, any other dep is replaced by its srcs
   (UPat(Ops.AFTER, name="x"), lambda x: x.replace(src=(x.src[0],)+
     tuple(dedup(flatten([(y,) if y.op in {Ops.RANGE, Ops.STORE, Ops.CALL, Ops.BARRIER, Ops.END, Ops.BACKEDGE, Ops.LINEAR, Ops.STAGE}
-                        else y.src for y in x.src[1:]]))))),
+                        else (UOp(Ops.NOOP).after(y.src[0]).end(*y.src[1:]),) if y.op is Ops.REDUCE else y.src for y in x.src[1:]]))))),
   # after/end with 1 src is just src[0]
   (UPat((Ops.AFTER, Ops.END), src=(UPat.var("s"),)), lambda s: s),
-  # ranges can be subbed for CONSTs, remove them from ENDs. BACKEDGE conditions are never range selectors.
-  (UPat(Ops.END, name="x"), lambda x: x.replace(src=(x.src[0],)+tuple(r for r in x.src[1:] if r.op is not Ops.CONST))),
   # the rules above key on bare CONSTs, so a redundantly committed const has to be uncast in the same fixpoint
 ])+div_and_mod_symbolic+pm_uncast_const
 
@@ -475,8 +475,6 @@ sym = symbolic+pm_simplify_valid+PatternMatcher([
   # reduce mul chain, move muls after the reduce
   (UPat(Ops.MUL).reduce(name="r", allow_any_len=True), reduce_mul_chain),
   # ** combine terms (opinionated) **
-  # -(x+y) -> -x + -y
-  (-1 * (UPat.var("x") + UPat.var("y")).named("a"), lambda a,x,y: (-x)+(-y) if fits(a, -x.vmin) and fits(a, -y.vmin) else None),
   # (x+y)*c -> x*c+y*c. only for int, float has inf*0=nan issue
   ((UPat.var("x", dtypes.weakint) + UPat.var("y")).named("a") * UPat.cvar("c"),
    lambda a,x,y,c: x*c+y*c if all(fits(a, v*c.vmin) for v in (x.vmin, x.vmax, y.vmin, y.vmax)) else None),

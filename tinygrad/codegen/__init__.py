@@ -12,7 +12,7 @@ from tinygrad.dtype import dtypes, AddrSpace
 
 # import all pattern matchers here
 from tinygrad.codegen.gpudims import pm_group_gpudims, pm_range_to_special
-from tinygrad.uop.symbolic import sym, symbolic_simple, symbolic, pm_move_where_on_load, pm_clean_up_group_sink, pm_remove_invalid, invalid_gate
+from tinygrad.uop.symbolic import sym, symbolic_simple, symbolic, pm_move_where_on_load, pm_clean_up_group_sink, pm_remove_invalid
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.codegen.decomp.dtype import DTypeDecompCtx, pm_dtype_decomps
 from tinygrad.codegen.decomp.op import get_late_rewrite_patterns, get_simplifying_rewrite_patterns
@@ -139,10 +139,10 @@ devectorizer2 = pm_mops+PatternMatcher([
   (UPat(Ops.INDEX, src=(UPat.var('x'),)), lambda x: x),
   # unpack WMMA
   (UPat(Ops.WMMA, name="u"), do_stack_wmma),
-  # RESHAPE a void is removed (hack for AFTER)
-  (UPat(Ops.RESHAPE, dtype=dtypes.void, name="x"), lambda x: x.src[0]),
   # reshape of a single element shaped value to scalar is an index
   (UPat(Ops.RESHAPE, name="x"), lambda x: x.src[0].index(0) if x.marg == () and x.src[0].shape == (1,) else None),
+  # a scalar index into a one-lane STACK is its lane, 0 is the only in-bounds index
+  (UPat(Ops.INDEX, src=(UPat(Ops.STACK, src=(UPat.var("x"),)), UPat.var("i"))), lambda x,i: x if i.shape == () else None),
 ])
 
 def fix_group_for_reduce(x:UOp):
@@ -191,12 +191,6 @@ def lower_reduce(ctx:itertools.count, r:UOp):
   acc_initted = acc.after(acc_init, *r.src[1:])
   acc_out = acc_initted.store(acc_initted.alu(op, ret)).end(*r.src[1:])
   return acc.after(acc_out)
-
-# an Invalid in a REDUCE source is that reduce's identity
-pm_reduce_identity = PatternMatcher([
-  (invalid_gate.reduce(allow_any_len=True, name="red"), lambda red,cond,x,i:
-   red.replace(src=(cond.where(x, x.const_like(identity_element(red.arg[0], red.dtype))),)+red.src[1:])),
-])
 
 pm_reduce_local = pm_wmma_add+PatternMatcher([
   # fix group for reduce
@@ -285,7 +279,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
 
   # ** expander (expand_rewrite) **
   # reduce_unparented: a REDUCE whose src folded to a CONST (e.g. x*0) has no parented ranges, collapse it before the expander
-  sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range+pm_reduce_unparented+pm_reduce_identity, name="postopt symbolic")
+  sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range+pm_reduce_unparented, name="postopt symbolic")
 
   # expand
   sink = graph_rewrite(sink, expander, ctx=build_range_map(sink), name="expander")
@@ -315,7 +309,7 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   sink = memory_coalescing(sink, ren)
   # an image is read_only or write_only, so a PARAM that is both loaded and stored stays a buffer
   loaded, stored = [{u.src[0].buf_uop for u in sink.toposort() if u.op is op} for op in (Ops.LOAD, Ops.STORE)]
-  sink = graph_rewrite(sink, symbolic_simple+pm_simplify_add_image, name="add images", ctx=({}, ren, loaded & stored), bottom_up=True)
+  sink = graph_rewrite(sink, pm_simplify_add_image, name="add images", ctx=({}, ren, loaded & stored), bottom_up=True)
 
   # extra symbolic before decomp. crashes without this?
   # NOTE: also run indexing_simplify here, while the index is still weakint and (x+y)*c -> x*c+y*c applies
@@ -470,7 +464,7 @@ pm_to_program = PatternMatcher([
   (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
 ])
 
-@rewrite_group(name=lambda ast,renderer,ret,**_: TracingKey((k:=ret.src[0].arg).name,(ret.key, k.function_name),ret=renderer), replay=True)
+@rewrite_group(name=lambda ast,renderer,ret,**_: TracingKey((k:=ret.src[0].arg).name,(ret.key,k.function_name),ret=renderer),replay="process_replay")
 @Context(ALLOW_DEVICE_USAGE=0)
 def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   """

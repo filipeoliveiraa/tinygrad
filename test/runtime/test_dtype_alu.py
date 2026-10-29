@@ -290,6 +290,10 @@ class TestDTypeALU(unittest.TestCase):
       self.assertEqual(((x*x)>>4).tolist(), [0, 0])
       self.assertEqual(((x+1)<1).tolist(), [True, False])
 
+  def test_pow_one_keeps_dtype(self):
+    self.assertEqual(((1**Tensor([2], dtype=dtypes.uint8))+255).cast(dtypes.uint32).tolist(), [0])
+    self.assertEqual((1**Tensor([2], dtype=dtypes.int8)).bitcast(dtypes.uint8).tolist(), [1])
+
   def test_div_add_div_no_overflow(self):
     for dt in (dtypes.uint32, dtypes.uint64):
       x = Tensor([dt.max-1], dtype=dt)
@@ -303,8 +307,17 @@ class TestDTypeALU(unittest.TestCase):
   def test_add_add_no_overflow(self):
     self.assertEqual((((Tensor([-2**31, 1-2**31], dtype=dtypes.int32)+2**30)+2**30)//2).tolist(), [0, 0])
 
+  def test_neg_zero(self):
+    self.assertEqual((1/-Tensor([0., -0.])).tolist(), [-math.inf, math.inf])
+
+  def test_neg_add_half_zero(self):
+    self.assertEqual((1/-(Tensor([0.])+Tensor([-0.])).half()).tolist(), [-math.inf])
+
   def test_neg_add_no_overflow(self):
     self.assertEqual((-(Tensor([1, 2], dtype=dtypes.int32)+(-2**31))==2**31-1).tolist(), [True, False])
+
+  def test_neg_add_signed_zero(self):
+    self.assertEqual((1/-(Tensor([0.])+Tensor([-0.]))).tolist(), [-math.inf])
 
   def test_add_mul_no_overflow(self):
     self.assertEqual((((Tensor([-715827887, 0], dtype=dtypes.int32)+5)*3)==-2**31+2).tolist(), [True, False])

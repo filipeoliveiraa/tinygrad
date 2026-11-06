@@ -666,12 +666,19 @@ class TestCustomKernel(unittest.TestCase):
     def kernel(A:UOp): return A[0].store(UOp.stack(UOp.const(42, dtypes.int)).index(A[1].load())).sink(arg=KernelInfo(opts_to_apply=()))
     self.assertEqual(Tensor.zeros(2, dtype=dtypes.int).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [42, 0])
 
+  def test_identity_shrink_keeps_offset_effect(self):
+    def kernel(A:UOp, B:UOp):
+      s = UOp.const(0, dtypes.weakint).after(A[0].store(7))
+      return B[0].store(A.shrink(((s, s+1),))[0].load()).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor.zeros(1, dtype=dtypes.int).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([7], [7]))
+
   @unittest.skipUnless(isinstance(Device[Device.DEFAULT].renderer, CStyleLanguage), "custom renders in cstyle")
   def test_custom_uop(self):
     N = 4
     def kernel(x:UOp) -> UOp:
-      shuffle_fn = UOp.custom_function("__builtin_shufflevector({0}, {0}, 3, 2, 1, 0)", shape=(N,), dtype=x.dtype, fmt=True)
-      y = shuffle_fn.call(UOp.stack([x[i].load() for i in range(N)]))
+      y = UOp.custom_function("__builtin_shufflevector({0}, {0}, 3, 2, 1, 0)", shape=(N,), dtype=x.dtype,
+                              fmt=True).call(UOp.stack([x[i].load() for i in range(N)]))
       self.assertEqual(y.shape, (N,))
       return x.store(y).sink(arg=KernelInfo("kernel"))
     out = Tensor.custom_kernel(Tensor.arange(N).clone("CPU"), fxn=kernel)[0]

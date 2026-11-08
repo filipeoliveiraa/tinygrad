@@ -191,6 +191,13 @@ class TestMultiTensor(unittest.TestCase):
     grad = Tensor.stack(X, Y).sum().gradient(X)[0]
     np.testing.assert_allclose(grad.numpy(), 1)
 
+  def test_stack_sharded_with_replicated(self):
+    X = Tensor([[1, 2], [3, 4]]).shard(devices_2, 0)
+    Y = Tensor([[5, 6], [7, 8]]).shard(devices_2)
+    self.assertEqual(X.stack(Y).tolist(), [[[1, 2], [3, 4]], [[5, 6], [7, 8]]])
+    self.assertEqual(Y.stack(X).tolist(), [[[5, 6], [7, 8]], [[1, 2], [3, 4]]])
+    self.assertEqual(X.cat(Y, dim=1).tolist(), [[1, 2, 5, 6], [3, 4, 7, 8]])
+
   def test_allreduce_naive(self):
     with Context(RING=0):
       a,b = _test_allreduce(Tensor.rand(256, 256))
@@ -969,6 +976,10 @@ class Test2DShard(unittest.TestCase):
     out = t.contiguous().realize()
     np.testing.assert_equal(out.numpy(), ref.numpy())
 
+  def test_2d_shard_copy_to_one(self):
+    ref = Tensor.arange(8*6).reshape(8, 6).contiguous().realize()
+    np.testing.assert_equal(self._shard_2d(ref).to(Device.DEFAULT).numpy(), ref.numpy())
+
   def test_2d_shard_clone(self):
     ref = Tensor.arange(16).reshape(4, 4).realize()
     t = self._shard_2d(ref)
@@ -1289,7 +1300,6 @@ class TestMultiFromUnrenderable(unittest.TestCase):
     ll = t.shard((d0, d1), axis=0) + 1
     np.testing.assert_equal(ll.numpy(), np.arange(100)+1)
 
-@unittest.skipIf(not_support_multi_device(), "need multi")
 @unittest.skipIf(not_support_multi_device(), "need multi")
 class TestMultiSetitem(unittest.TestCase):
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(4))

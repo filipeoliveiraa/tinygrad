@@ -4,7 +4,7 @@ from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ
 from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, TracingKey, Context, panic
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, MapCtx, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_weak, pm_commit_weak, pm_cast_const
-from tinygrad.uop.render import render_uir
+from tinygrad.uop.uir import render_uir
 from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
 from tinygrad.renderer import Renderer, Estimates
 from tinygrad.renderer.x86 import ISARenderer, IselContext
@@ -22,8 +22,8 @@ from tinygrad.codegen.opt.postrange import apply_opts
 from tinygrad.codegen.late.gater import pm_move_gates_from_index
 from tinygrad.codegen.simplify import pm_simplify_ranges, pm_flatten_range, pm_split_ranges, pm_load_collapse, pm_reduce_unparented
 from tinygrad.schedule.multi import multi_pm
-from tinygrad.schedule.prepare import pm_mops, expand_bitcast
-from tinygrad.schedule.indexing import _stack_select, apply_movement_op
+from tinygrad.schedule.prepare import pm_mops, expand_bitcast, _mop_index
+from tinygrad.schedule.indexing import _stack_select
 from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
 from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
 from tinygrad.codegen.late.coalesce import memory_coalescing, pm_simplify_add_image
@@ -115,10 +115,10 @@ pm_expand_broadcast = pm_wmma_add+PatternMatcher([
 ])
 
 def index_lane(x:UOp, idx:tuple[UOp, ...]) -> UOp:
-  # x.index(*idx) with the index pushed through the movement ops, like _mop_index in pm_mops
-  while x.op in GroupOp.Movement and len(idx) == len(x.shape):
-    x, idx = x.src[0], apply_movement_op(x.op, x.src[0].shape, x.marg, idx)
-  return x.index(*idx)
+  # x.index(*idx) with the index pushed through the movement ops
+  ret = x.index(*idx)
+  while ret.op is Ops.INDEX and ret.src[0].op in GroupOp.Movement and (nxt:=_mop_index(ret.src[0], ret)) is not None: ret = nxt
+  return ret
 
 def do_devectorize(b:UOp):
   if b.shape == (): return None

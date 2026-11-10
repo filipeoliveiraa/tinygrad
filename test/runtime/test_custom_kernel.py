@@ -520,6 +520,12 @@ class TestCustomKernel(unittest.TestCase):
       return B[0].store(UOp.const(((1, 2), (3, 4)), dtypes.int).index(A[0].load())[A[1].load()]).sink(arg=KernelInfo(opts_to_apply=()))
     self.assertEqual(Tensor.custom_kernel(Tensor([1, 0]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)[1].tolist(), [3])
 
+  def test_index_coordinate_read(self):
+    def kernel(A:UOp, B:UOp, C:UOp): return B[0].store(C[A[0]]).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b, c = Tensor([2]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), Tensor([10, 11, 12]).contiguous()
+    with Context(CHECK_OOB=0):
+      self.assertEqual(Tensor.custom_kernel(a, b, c, fxn=kernel)[1].tolist(), [12])
+
   def test_index_vector_bitcast_widen(self):
     def kernel(A:UOp, B:UOp): return B[0].store(A.index().load().bitcast(dtypes.int32)[1]).sink(arg=KernelInfo(opts_to_apply=()))
     _, b = Tensor.custom_kernel(Tensor([1, 2, -3, 4], dtype=dtypes.int16).contiguous(), Tensor.zeros(1, dtype=dtypes.int32).contiguous(), fxn=kernel)
@@ -547,6 +553,16 @@ class TestCustomKernel(unittest.TestCase):
       return x.store(y).sink(arg=KernelInfo("kernel"))
     out = Tensor.custom_kernel(Tensor.arange(N).clone("CPU"), fxn=kernel)[0]
     self.assertEqual(out.tolist(), [3, 2, 1, 0])
+
+  def test_alloc(self):
+    def kernel(out:UOp, inp:UOp):
+      alloc = UOp.alloc((1,), dtypes.int, -1, addrspace=AddrSpace.REG)
+      buf = UOp._buffer(1, dtypes.int, -1, addrspace=AddrSpace.REG)
+      alloc = alloc[0].set(inp[0])
+      buf = buf.after(alloc)[0].set(inp[1])
+      return out[0].store(alloc.after(buf)[0] + buf[0]).sink(arg=KernelInfo(opts_to_apply=()))
+    out = Tensor.custom_kernel(Tensor.empty(1, dtype=dtypes.int), Tensor([2, 3]).realize(), fxn=kernel)[0]
+    self.assertEqual(out.tolist(), [5])
 
 class TestCustomKernelArgs(unittest.TestCase):
   def test_duplicate_call_arg(self):

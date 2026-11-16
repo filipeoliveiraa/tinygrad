@@ -1,5 +1,6 @@
 import unittest, base64, functools, re, unicodedata, json, pathlib, tempfile
-from tinygrad.llm.cli import SimpleTokenizer, FallbackTemplate
+from tinygrad.llm.cli import FallbackTemplate
+from tinygrad.llm.tokenizer import SimpleTokenizer
 from tinygrad.helpers import fetch
 
 class TestLLMTokenizer(unittest.TestCase):
@@ -155,6 +156,11 @@ class TestLLMTokenizer(unittest.TestCase):
       self.assertEqual(split["kimi-k2"](s), go, f"kimi-k2 {s!r}")
     self.assertEqual(split["kimi-k2"]("a.\n/b"), ["a", ".\n", "/b"])
 
+  def test_qwen35_split_marks(self):
+    split = SimpleTokenizer({}, {}, "qwen35")._split_to_word.findall
+    self.assertEqual(split("नमस्ते दुनिया"), ["नमस्ते", " दुनिया"])
+    self.assertEqual(split("!!\u0301"), ["!!", "\u0301"])
+
   def test_joyai_llm_split(self):
     tok = SimpleTokenizer({}, {}, "joyai-llm")
     tok._encode_word = lambda word: [word.decode()]
@@ -163,6 +169,10 @@ class TestLLMTokenizer(unittest.TestCase):
     self.assertEqual(tok.encode("it's I'M don'T"), ["it", "'s", " I", "'M", " don", "'T"])
     self.assertEqual(tok.encode("  你好hello"), ["  ", "你好", "hello"])
     self.assertEqual(tok.encode("a\u200b"), ["a", "\u200b"])
+
+  def test_olmo_split(self):
+    split = SimpleTokenizer({}, {}, "olmo")._split_to_word.findall
+    self.assertEqual(split("in 12345,\n\nI'LL"), ["in", " 12345", ",", "\n", "\n", "I", "'", "LL"])
 
   def test_stream_decoder(self):
     """stream_decoder buffers incomplete UTF-8: token 25677 has 3/4 of emoji, token 138 completes it."""

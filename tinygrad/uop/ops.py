@@ -15,11 +15,13 @@ if TYPE_CHECKING:
   from tinygrad.renderer import Estimates
   from tinygrad.runtime.support.hcq2 import HCQInfo
   from tinygrad.renderer.x86 import Register
+  from tinygrad.renderer.amd.dsl import Reg
 
 class AxisType(Enum):
   def __repr__(self): return str(self)
   def __lt__(self, other:AxisType): return self.value < other.value
   # Nesting order: RANGE args sort by axis type, then axis id.
+  # LOOP iterations run in order. WEAK ones may run in parallel or be upcast
   DEVICE = auto(); GLOBAL = auto(); LOCAL = auto(); WARP = auto(); WEAK = auto(); LOOP = auto() # noqa: E702
   UPCAST = auto(); PLACEHOLDER = auto() # noqa: E702
 
@@ -42,7 +44,7 @@ class ParamArg:
   # the memory the linker gives an ALLOC
   spec: BufferSpec|None = None
   # optional register constraints on this allocation, for assembly backends
-  reg: Register|None = None
+  reg: Register|Reg|None = None
   def __repr__(self):
     fields = (("vmin_vmax", None), ("name", None), ("addrspace", AddrSpace.GLOBAL), ("device", None),
               ("volatile", False), ("image", None), ("bind_on_realize", False), ("val", None), ("spec", None), ("reg", None))
@@ -123,7 +125,7 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType:
   match op:
     case Ops.STORE | Ops.LINEAR | Ops.SINK | Ops.PROGRAM | Ops.SOURCE | \
          Ops.BACKEDGE | Ops.BARRIER | Ops.IF | Ops.ENDIF | Ops.NOOP | \
-         Ops.REWRITE_ERROR | Ops.PYLITERAL:
+         Ops.REWRITE_ERROR | Ops.PYLITERAL | Ops.ASM:
       # always void
       return dtypes.void
     case Ops.CALL:
@@ -333,7 +335,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     match self.op:
       # late ops don't have shape
       case Ops.IF | Ops.BARRIER | Ops.SINK | Ops.REWRITE_ERROR | Ops.ENDIF | Ops.BACKEDGE | \
-           Ops.LINEAR | Ops.PROGRAM | Ops.SOURCE:
+           Ops.LINEAR | Ops.PROGRAM | Ops.SOURCE | Ops.ASM:
         return None
 
       # INS shape is always scalar, vector width is in the instruction encoding
@@ -597,6 +599,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def barrier(self, *src:UOp): return UOp(Ops.BARRIER, src=(self,)+src)
   @staticmethod
   def ins(op, src:tuple[UOp, ...], dtype:DType) -> UOp: return UOp(Ops.INS, src, (op, dtype))
+  @staticmethod
+  def asm(op) -> UOp: return UOp(Ops.ASM, arg=op)
   def contract(self, *rngs:UOp):
     assert all(x.axis_type == AxisType.UPCAST for x in rngs), "all contract ranges must be upcast"
     return UOp.stack(*[self.substitute(dict(zip(rngs, [r.const_like(i) for r,i in zip(rngs, idx)])))
@@ -616,10 +620,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   @staticmethod
   def cconst(b:ConstLike, dtype:DType): return UOp(Ops.CAST, src=(UOp.const(b),), arg=dtype)
   @staticmethod
-  def range(end:sint, axis_id, axis_type=AxisType.WEAK, *, dtype=dtypes.weakint):
+  def range(end:sint, axis_id, axis_type=AxisType.LOOP, *, dtype=dtypes.weakint):
     return UOp(Ops.RANGE, src=(sint_to_uop(end, dtype),), arg=(axis_type, axis_id))
   @staticmethod
-  def loop(axis_id:int): return UOp(Ops.RANGE, src=(UOp(Ops.NOOP),), arg=(AxisType.WEAK, axis_id))
+  def loop(axis_id:int): return UOp.range(UOp(Ops.NOOP), axis_id, dtype=dtypes.void)
   @staticmethod
   def special(end:sint, name:str): return UOp(Ops.SPECIAL, src=(sint_to_uop(end),), arg=name)
   @staticmethod
@@ -802,7 +806,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   unique_num = itertools.count(0)
 
   def getaddr(self, device=None) -> UOp:
-    if self.without_after.op not in GroupOp.Defines|{Ops.SHRINK, Ops.BITCAST, Ops.BINARY, Ops.MSTACK, Ops.MSELECT, Ops.LINEAR}: return self
+    if self.without_after.op not in GroupOp.Defines|{Ops.SHRINK, Ops.BITCAST, Ops.MSTACK, Ops.MSELECT, Ops.LINEAR}: return self
     return UOp(Ops.GETADDR, src=(self,), arg=device or to_tuple(self.device)[0])
   @staticmethod
   def device_range_src(device:str|tuple[str, ...]|None) -> tuple[UOp, ...]:
@@ -883,7 +887,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if self.op in {Ops.SPECIAL, Ops.RANGE, Ops.CONST}: return AddrSpace.ALU
     if self.op is Ops.BINARY: return AddrSpace.GLOBAL
     if self.op is Ops.LOAD: return AddrSpace.ALU # LOAD brings things into the ALU
-    if self.op in {Ops.INDEX, Ops.CAST, Ops.AFTER, Ops.REDUCE, Ops.STORE, Ops.MSTACK, Ops.MSELECT, Ops.END, Ops.UNSHARD}:
+    if self.op in {Ops.INDEX, Ops.CAST, Ops.AFTER, Ops.REDUCE, Ops.MSTACK, Ops.MSELECT, Ops.END, Ops.UNSHARD}:
       return self.src[0].addrspace
     if self.op in GroupOp.Movement: return self.src[0].addrspace
     if self.op in {Ops.STACK, Ops.WMMA} or self.op in GroupOp.Elementwise:
@@ -893,7 +897,6 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return None
   @property
   def buf_uop(self) -> UOp:
-    if self.op in GroupOp.Defines: return self
     if self.op is Ops.MSELECT: return self.src[0].buf_uop.mselect(self.arg)
     if self.op is Ops.MSTACK: return UOp(Ops.MSTACK, src=tuple(x.buf_uop for x in self.src))
     if self.base.op is Ops.AFTER: return self.base.src[0].buf_uop.base
@@ -902,7 +905,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return s
 
   def contiguous_view(self) -> tuple[UOp, int]|None:
-    from tinygrad.schedule.prepare import pm_mops
+    from tinygrad.codegen.prepare import pm_mops
     from tinygrad.uop.symbolic import symbolic
 
     # WEBGPU and CL do not support views.
@@ -1167,11 +1170,13 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   @staticmethod
   def alloc(shape:tuple[sint, ...], dtype:DType, slot:int|None=None, addrspace=AddrSpace.GLOBAL, device=None, axis:int|None=None,
-            spec:BufferSpec|None=None, bind_on_realize:bool=False, name:str|None=None):
+            spec:BufferSpec|None=None, bind_on_realize:bool=False, name:str|None=None, reg:Register|Reg|None=None):
     ret = UOp(Ops.ALLOC, src=(shape_to_shape_arg((prod(to_max_shape(shape)),)),)+UOp.device_range_src(device),
               arg=ParamArg(next(UOp.unique_num) if slot is None else slot, strong_dtype(dtype),
-                           addrspace=addrspace, device=device, spec=spec, bind_on_realize=bind_on_realize, name=name))
+                           addrspace=addrspace, device=device, spec=spec, bind_on_realize=bind_on_realize, name=name, reg=reg))
     return ret.reshape(()) if not shape else ret.view_as(shape, axis)
+  @staticmethod
+  def extern(shape:tuple[int, ...], dtype:DType, device, name:str): return UOp.alloc(shape, dtype, 0, device=device, name=name).replace(op=Ops.EXTERN)
   def alloc_like(self, slot:int|None=None, addrspace=AddrSpace.GLOBAL): return UOp.alloc(self.max_shard_shape, self.dtype, slot, addrspace)
 
   @staticmethod
@@ -1196,14 +1201,14 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # TODO: this should replace placeholder
   @staticmethod
   def param(slot:int, dtype:DType, shape:tuple[sint, ...]|sint|None=None, device=None, vmin_vmax:tuple[PyConst, PyConst]|None=None,
-            name=None, addrspace=AddrSpace.GLOBAL, volatile:bool=False):
+            name=None, addrspace=AddrSpace.GLOBAL, volatile:bool=False, reg:Register|Reg|None=None):
     """create a PARAM: a single sint or 1-d shape gives a flat param of that size, a None shape gives a scalar param.
     src[0] stores the concrete max size (never symbolic): a multi-dim shape is a RESHAPE on top of the flat param,
     a symbolic shape is a max-size param shrunk to the real shape"""
     if dtype in dtypes.weaks: raise RuntimeError(f"cannot create param for weak dtype {dtype}")
     shape = (shape,) if isinstance(shape, (int, UOp)) else shape or ()
     ret = UOp(Ops.PARAM, src=(shape_to_shape_arg((prod(to_max_shape(shape)),) if shape else ()),),
-              arg=ParamArg(slot, dtype, vmin_vmax, name, addrspace, device, volatile))
+              arg=ParamArg(slot, dtype, vmin_vmax, name, addrspace, device, volatile, reg=reg))
     return ret.view_as(shape)
   def param_like(self, slot:int, name:str|None=None):
     # Scalar arguments bind by slot; names and values stay at the call site, not in schedule cache keys.
@@ -1356,7 +1361,7 @@ class ProgramInfo:
                        tuple(sorted(dedup(ins))), target)
 
 # the body of a CALL is always one of these: programs (SINK/PROGRAM/LINEAR), bulk stores, and function references
-OPAQUE_CALL_BODIES = {Ops.SINK, Ops.PROGRAM, Ops.LINEAR, Ops.STORE, Ops.CUSTOM_FUNCTION}
+OPAQUE_CALL_BODIES = {Ops.SINK, Ops.PROGRAM, Ops.LINEAR, Ops.STORE, Ops.CUSTOM_FUNCTION, Ops.ASM}
 
 # the arg of CUSTOM_FUNCTION: an external function symbol and the dtype of the value it returns
 @dataclass(frozen=True)

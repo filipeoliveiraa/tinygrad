@@ -6,7 +6,7 @@ from collections import defaultdict, Counter
 from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, Context, panic, partition, to_name, flatten, DEBUG, VIZ, ALL2ALL, PROFILE
 from tinygrad.device import Device, Buffer, BufferSpec, Compiled, HCQ_RUNTIME_DEV, HCQ_DEVS, HOST_DEVS, UVM_DEVS, ProfileProgramEvent
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu, uopfunc
-from tinygrad.uop.ops import pm_renumber_slots, CountCtx, sint_to_uop, pm_flatten_linear
+from tinygrad.uop.ops import pm_renumber_slots, CountCtx, sint_to_uop, pm_flatten_linear, AxisType
 from tinygrad.dtype import dtypes, AddrSpace, truncate
 from tinygrad.renderer import Estimates, TinyELF
 from tinygrad.runtime.support.c import Struct
@@ -48,7 +48,7 @@ def unwrap_lane(v:UOp) -> tuple[UOp, int|None, int]: # look through views and a 
 
 # **** commands
 
-def timeline(dev:str) -> UOp: return UOp.alloc((2,), dtypes.u64, 0, device=dev, name="timeline").replace(op=Ops.EXTERN)
+def timeline(dev:str) -> UOp: return UOp.extern((2,), dtypes.u64, dev, "timeline")
 def timeline_value(dev:str) -> UOp: return timeline(dev).index(1).load()
 
 def make_program(prg:UOp, size:int, device:str) -> UOp:
@@ -202,7 +202,7 @@ def stage_copy(call:UOp, dst:UOp, src:UOp) -> UOp|None:
 
   if Device[device].has_copy_queue: return None
   out, inp = (UOp.param(i, dtypes.u8, b.nbytes(), device=device) for i, b in enumerate((dst, src)))
-  ast = out.index(r:=UOp.range(src.nbytes(), 0)).store(inp.index(r).load()).end(r).sink(arg=KernelInfo())
+  ast = out.index(r:=UOp.range(src.nbytes(), 0, AxisType.WEAK)).store(inp.index(r).load()).end(r).sink(arg=KernelInfo())
   return lower_and_compile(call.replace(src=(ast, *call.src[1:])))
 
 pm_insert_copy_staging = PatternMatcher([
@@ -525,12 +525,13 @@ class LinkCtx: inputs:list[UOp]; refs:list[UOp] = field(default_factory=list) # 
 def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp:
   if b.arg.name is None: return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
   dev, spec = Device[b.device], b.arg.spec or BufferSpec(cpu_access=True)
-
-  owned = Compiled.link_bufs.get(b.arg.name, Compiled.link_bufs.get(to_name(b.device, b.arg.name)))
-  if owned is not None: r = owned if isinstance(owned, Buffer) else owned(b)
-  else: r = Buffer(dev.device, max(b.max_numel(), 1) * b.dtype.itemsize, options=spec, preallocate=True)
-
+  r = Buffer(dev.device, max(b.max_numel(), 1) * b.dtype.itemsize, options=spec, preallocate=True)
   return UOp.from_buffer(r, b.dtype, HCQ_RUNTIME_DEV.device)
+
+def resolve_extern(ctx:LinkCtx, b:UOp) -> UOp:
+  if b.arg.name is None: return ctx.inputs[b.arg.slot]
+  owned = Compiled.link_bufs[b.arg.name if b.arg.name in Compiled.link_bufs else to_name(b.device, b.arg.name)]
+  return UOp.from_buffer(owned if isinstance(owned, Buffer) else owned(b), b.dtype, HCQ_RUNTIME_DEV.device)
 
 def resolve_getaddr(ctx:LinkCtx, g:UOp) -> UOp|None:
   if unwrap_lane(buf:=(v:=unwrap_view(g.src[0]))[0])[0].op is not Ops.BUFFER: return None # input address, resolved per run
@@ -551,7 +552,7 @@ pm_resolve_link = PatternMatcher([
   (UPat(Ops.CAST, src=(UPat(Ops.CAST, src=(UPat.cvar(),), name="inner"),), name="c"), lambda c, inner: inner.src[0].cast(c.dtype)),
   # an alloc and an extern become buffers
   (UPat(Ops.ALLOC, name="b"), bufferize_buf),
-  (UPat(Ops.EXTERN, name="b"), lambda ctx, b: ctx.inputs[b.arg.slot] if b.arg.name is None else bufferize_buf(ctx, b)),
+  (UPat(Ops.EXTERN, name="b"), resolve_extern),
   # the address of a buffer is a const
   (UPat(Ops.GETADDR, name="g"), resolve_getaddr),
   # math on consts is a const

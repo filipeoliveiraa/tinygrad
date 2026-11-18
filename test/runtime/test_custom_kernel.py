@@ -568,22 +568,26 @@ class TestCustomKernel(unittest.TestCase):
   def test_custom_uop(self):
     N = 4
     def kernel(x:UOp) -> UOp:
-      y = UOp.custom_function("__builtin_shufflevector({0}, {0}, 3, 2, 1, 0)", shape=(N,), dtype=x.dtype,
+      y = UOp.native("__builtin_shufflevector({0}, {0}, 3, 2, 1, 0)", shape=(N,), dtype=x.dtype,
                               fmt=True).call(UOp.stack([x[i].load() for i in range(N)]))
       self.assertEqual(y.shape, (N,))
       return x.store(y).sink(arg=KernelInfo("kernel"))
     out = Tensor.custom_kernel(Tensor.arange(N).clone("CPU"), fxn=kernel)[0]
     self.assertEqual(out.tolist(), [3, 2, 1, 0])
 
-  def test_alloc(self):
+  def test_alloc(self, N=1):
     def kernel(out:UOp, inp:UOp):
-      alloc = UOp.alloc((1,), dtypes.int, -1, addrspace=AddrSpace.REG)
-      buf = UOp._buffer(1, dtypes.int, -1, addrspace=AddrSpace.REG)
-      alloc = alloc[0].set(inp[0])
-      buf = buf.after(alloc)[0].set(inp[1])
-      return out[0].store(alloc.after(buf)[0] + buf[0]).sink(arg=KernelInfo(opts_to_apply=()))
-    out = Tensor.custom_kernel(Tensor.empty(1, dtype=dtypes.int), Tensor([2, 3]).realize(), fxn=kernel)[0]
-    self.assertEqual(out.tolist(), [5])
+      i = UOp.range(N, 0, AxisType.LOOP)
+      alloc = UOp.alloc((N,), dtypes.int, -1, addrspace=AddrSpace.REG)
+      buf = UOp._buffer(N, dtypes.int, -1, addrspace=AddrSpace.REG)
+      alloc = alloc[i].set(inp[i])
+      buf = buf.after(alloc)[i].set(inp[i+N])
+      return out[i].store(alloc.after(buf)[i] + buf[i]).end(i).sink(arg=KernelInfo(opts_to_apply=()))
+    out = Tensor.custom_kernel(Tensor.empty(N, dtype=dtypes.int), Tensor.arange(2*N).clone().realize(), fxn=kernel)[0]
+    self.assertEqual(out.tolist(), [2*i+N for i in range(N)])
+
+  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX does not support dynamic register indexing")
+  def test_alloc_vec(self): self.test_alloc(4)
 
   def test_store_value_broadcasts_to_target(self):
     def stored(shape:tuple[int, ...]) -> list:

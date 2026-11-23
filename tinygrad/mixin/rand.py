@@ -1,4 +1,3 @@
-from __future__ import annotations
 import math
 from typing import Self, cast
 from tinygrad.dtype import DType, DTypeLike, dtypes, least_upper_dtype, to_dtype, bitcast
@@ -291,7 +290,7 @@ class RandMixin(OpMixin):
     """
     if not 0 <= p <= 1: raise ValueError(f"{p=} is out of range [0, 1]")
     if not TRAINING or p == 0: return self
-    if p == 1: return self.const_like(0)
+    if p == 1: return self * 0
     return (self.rand_like(dtype=dtypes.default_float, contiguous=False) >= p).clone().where(self, 0) / (1.0 - p)
 
   def scaled_dot_product_attention(self, key:Self, value:Self, attn_mask:Self|None=None, dropout_p:float=0.0,

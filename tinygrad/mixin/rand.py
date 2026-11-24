@@ -96,7 +96,7 @@ class RandMixin(OpMixin):
     ```
     """
     if (dt:=to_dtype(dtype or self.dtype)) in dtypes.weaks and dtype is None: raise ValueError(f"randn_like requires an explicit dtype for {dt}")
-    src = self.stack(self).rand_like(**{**kwargs, "dtype": dtypes.float32})
+    src = self.stack(self).rand_like(dtype=dtypes.float32, **kwargs)
     # https://en.wikipedia.org/wiki/Box%E2%80%93Muller_transform
     return src[0].mul(2*math.pi).cos().mul((1 - src[1]).log().mul(-2).sqrt()).cast(dt)
 
@@ -114,7 +114,7 @@ class RandMixin(OpMixin):
     print(Tensor.randn(2, 3).numpy())
     ```
     """
-    return cls.empty(*shape, **kwargs).randn_like(dtype=dtype)  # type: ignore[attr-defined]
+    return cls.empty(*shape, **kwargs).randn_like(dtype=dtype)
 
   @classmethod
   def randint(cls, *shape, low=0, high=10, dtype=dtypes.int32, **kwargs) -> Self:

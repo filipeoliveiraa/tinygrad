@@ -300,8 +300,8 @@ SMALL_BLOCK_QUANTS = {Q8_0: 17, IQ4_NL: 9, MXFP4: 17}
 
 def find_packed(decoded:Tensor, in_features:int) -> tuple[int, Tensor]|None:
   """(ggml type, packed words) if `decoded` is the lazy dequantization of packed ggml weights, rows of in_features."""
-  if in_features % 32: return None
-  packed_sizes = {t: decoded.numel() * sz // 256 for t, sz in QUANT_SIZES.items() if in_features % 256 == 0 or t in SMALL_BLOCK_QUANTS}
+  packed_sizes = {t: decoded.numel() * sz // 256 for t, sz in QUANT_SIZES.items() if in_features % _GGML_QUANT[t][0] == 0}
+  if not packed_sizes: return None
   ops = (Ops.UNSHARD,) if decoded.uop.axis is not None else (Ops.SHRINK, Ops.BUFFER)
   raw = next((u for u in decoded.uop.toposort() if u.op in ops and u.dtype == dtypes.uint8 and prod(u.shape) in packed_sizes.values()), None)
   if raw is None: return None
@@ -314,6 +314,6 @@ def find_packed(decoded:Tensor, in_features:int) -> tuple[int, Tensor]|None:
     expected = ggml_data_to_tensor(Tensor(raw).flatten(), int(decoded.numel()), ggml_type)
     if unwrapped(decoded.uop).key == unwrapped(expected.uop).key: break
   else: return None
-  word_dtype = dtypes.uint8 if ggml_type == MXFP4 else dtypes.uint16 if ggml_type in HALFWORD_QUANTS else dtypes.uint32
-  if (off:=raw.contiguous_view_offset()) is None or off % word_dtype.itemsize or raw.buf_uop.dtype != dtypes.uint8: return None
-  return ggml_type, Tensor(raw).flatten().bitcast(word_dtype).contiguous()
+  align = 1 if ggml_type == MXFP4 else 2 if ggml_type in HALFWORD_QUANTS else 4
+  if (off:=raw.contiguous_view_offset()) is None or off % align or raw.buf_uop.dtype != dtypes.uint8: return None
+  return ggml_type, Tensor(raw).flatten().contiguous()

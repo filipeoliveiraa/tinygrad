@@ -51,8 +51,8 @@ def _run_kernel(name:str, out_shape:tuple[int, ...], device:str|tuple[str, ...]|
   if kern.op is Ops.SINK and kern.arg is None:
     kern = kern.substitute({b: b.replace(src=b.src[:1] + UOp.device_range_src(device), arg=replace(b.arg, device=device))
                             for b in kern.toposort() if b.op is Ops.ALLOC and b.arg.device is None})
-  out = UOp.alloc(out_shape, dtypes.float32, device=device, axis=axis)
-  return Tensor(out.after(kern.call(out, *(a.uop if isinstance(a, Tensor) else a for a in args))))
+  out, used = UOp.alloc(out_shape, dtypes.float32, device=device, axis=axis), {p.arg.slot for p in kern.toposort() if p.op is Ops.PARAM}
+  return Tensor(out.after(kern.call(out, *(UOp.const(0) if i not in used else a.uop if isinstance(a, Tensor) else a for i, a in enumerate(args, 1)))))
 
 @functools.cache
 def _iq_lut(t:int, dev:str|tuple[str, ...]) -> UOp:
@@ -85,6 +85,7 @@ class Linear(nn.Linear):
   packed:Tensor|None = None
   use_custom_quant = True
   shard_axis:int|None = None
+  scale:Tensor|None = None
   weight_scale_inv:Tensor|None = None
   weight_block_size:tuple[int, int] = (128, 128)
   def __init__(self, in_features:int, out_features:int, bias=True, groups:int=1):
@@ -132,7 +133,8 @@ class Linear(nn.Linear):
 
   def _custom_dense(self, x:Tensor) -> Tensor|None:
     if self.groups != 1 or not isinstance(x.numel(), int) or self.in_features % 32 != 0: return None
-    w, xi = _unview_float(self.weight).contiguous(), _unview_float(x).contiguous()
+    if (w := _unview_float(self.weight)).uop.op is Ops.CAST or w.uop.contiguous_view() is None: return None
+    w, xi = w.contiguous(), _unview_float(x).contiguous()
     ok, tokens = (dtypes.float16, dtypes.bfloat16, dtypes.float32), int(prod(x.shape[:-1]))
     if w.uop.axis is not None or xi.uop.axis is not None or w.dtype not in ok or xi.dtype not in ok or tokens >= 16: return None
     if self.bias is not None and (self.bias.uop.axis is not None or self.bias.dtype not in ok): return None
@@ -145,6 +147,10 @@ class Linear(nn.Linear):
     return (out if self.bias is None else out + _unview_float(self.bias).float()).cast(out_dt).reshape(*x.shape[:-1], self.out_features)
 
   def __call__(self, x:Tensor) -> Tensor:
+    out = self._forward(x)
+    return out if self.scale is None else out * self.scale
+
+  def _forward(self, x:Tensor) -> Tensor:
     if self.weight_scale_inv is not None:
       out = fp8_matmul(x, self.weight, self.weight_scale_inv, self.weight_block_size)
       return out + self.bias if self.bias is not None else out
@@ -656,7 +662,7 @@ class TransformerBlock(FFNBlock):
       q_axis, valid_kv = q_in.uop.axis, sp if isinstance(sp, UOp) else UOp.const(int(sp))
       valid_kv_offset, attn = T_real if isinstance(T_real, int) else 0, None
       if resolve(T_real == 1, False) and sh_m == 1 and D % 64 == 0 and 1 <= D <= 512 \
-          and (group := sh_h // sh_hkv) in (1, 2, 4, 8) and N_phys % 64 == 0:
+          and 1 <= (group := sh_h // sh_hkv) <= 8 and N_phys % 64 == 0:
         attn = _run_kernel("amd_flash_decode", q_shard, q_in.device, q_in, kv, valid_kv, axis=q_axis, B=sh_b, H_KV=sh_hkv, G=group,
                            d_blks=D // 64, n_blks=N_phys // 64, C=min(max(8, 64 // (sh_b * sh_hkv)), 64, ceildiv(N_phys, 64)),
                            valid_kv_offset=valid_kv_offset)
@@ -992,7 +998,6 @@ class GatedDeltaNetBlock(FFNBlock):
     T_pad = x.max_shape[1]  # symbolic chunks are padded to their max size: one graph serves every size
 
     # input processing
-    x = x.half()
     out_gate = (self.ssm_g(x) if hasattr(self, "ssm_g") else self.ssm_g_b(self.ssm_g_a(x))) if is_kda else self.attn_gate(x)
     out_gate = out_gate.reshape(B, T, self.num_v_heads, self.head_v_dim)
     beta = self.ssm_beta(x).sigmoid().reshape(B, T, self.num_v_heads)
@@ -1145,13 +1150,14 @@ class Transformer:
         'ssm_conv1d_v.weight', 'ssm_dt.bias', 'ssm_a', 'ssm_beta.weight', 'ssm_f_b.weight', 'ssm_g.weight', 'ssm_g_b.weight', 'attn_gate.weight')})
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
-    ep = any(shape[-1] % (shard*_GGML_QUANT.get(typ, (1,))[0]) for k,(_,shape,typ) in entries.items() if 'ffn_down_exps.' in k)
+    ep = any(shape[-1] % (shard*_GGML_QUANT.get(typ, (1,))[0]) for k,(_,shape,typ) in entries.items() if k.endswith('ffn_down_exps.weight'))
     ep_axis = 0 if _amd_target(devices) is not None else None
     state_dict = gguf_shard(entries, devices, {k: v for k, v in ((k, ep_axis if ep and '_exps.' in k else v) for k, v in shard_map.items())
                                                if v is not None}, repeats)
 
     # all float state items should be float16, not float32
-    state_dict = {k:v.cast('float16') if getenv("HALF", 1) and dtypes.is_float(v.dtype) else v for k,v in state_dict.items()}
+    state_dict = {k:v.cast('float16') if getenv("HALF", 1) and dtypes.is_float(v.dtype) and not k.endswith('.scale') else v
+                  for k,v in state_dict.items()}
 
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if 'output.weight' not in state_dict: state_dict['output.weight'] = state_dict['token_embd.weight']
@@ -1272,7 +1278,9 @@ class Transformer:
       o_lora_rank=kv.get(f'{arch}.attention.output_lora_rank', 0), hash_layers=kv.get(f'{arch}.hash_layer_count', 0))
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
+    scales = {k.removesuffix('.scale'): state_dict.pop(k) for k in list(state_dict) if k.endswith('.scale')}
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
+    for k, v in scales.items(): get_child(model, k).scale = v
     # NOTE: without this contiguous, it unpacks the weights from the model every time. we shouldn't need this, but for now it's faster
     if realize:
       for s in (params:=nn.state.get_parameters(model)): s.replace(s.contiguous())

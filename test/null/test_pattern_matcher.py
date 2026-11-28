@@ -1,7 +1,9 @@
-import unittest, itertools
+import unittest, dis
+from tinygrad.helpers import DEBUG
+from tinygrad.uop.upat import _get_code, upat_compile
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, GroupOp # noqa: F401
-from tinygrad.uop.ops import PatternMatcher, UPat
+from tinygrad.uop.ops import PatternMatcher, UPat, rewrite_group
 
 # the rewrite uses a global defined after its PatternMatcher, like codegen's lower_call -> to_program
 late_pms = [PatternMatcher([(UPat(Ops.CONST, name="x"), lambda x: late_global(x))], compiled=c) for c in (False, True)]
@@ -235,15 +237,48 @@ class TestPatternMatcher(unittest.TestCase):
     self.assertIsNotNone(matcher.rewrite(u1))
     self.assertIsNotNone(matcher.rewrite(u2))
 
-  def _assert_eq_upat(self, a:UPat, b:UPat):
-    assert (sorted(map(str,a.op)) if a.op else [] == (sorted(map(str,b.op)) if b.op else []))
-    assert (sorted(a.match_dtype) if a.match_dtype else [] == (sorted(b.match_dtype) if b.match_dtype else []))
-    assert (a.name, type(a.src)) == (b.name, type(b.src))
-    def simple_src(u:UPat):
-      if u.src is None: return []
-      if isinstance(u.src, itertools.repeat): return next(u.src[0])
-      return u.src[0]
-    for a,b in zip(simple_src(a), simple_src(b)): self._assert_eq_upat(a, b)
+@rewrite_group()
+def do_compile(up):
+  print("\n***** COMPILE", up)
+  match_code = _get_code(up, False)
+  match = upat_compile(up, lambda **kwargs: None)
+  print(match_code[0])
+  if DEBUG >= 2: dis.dis(match)
+  return match_code[0]
+
+class TestUPatCompile(unittest.TestCase):
+  def test_double(self):
+    up = UPat.var("x") * UPat.cvar("c0") + UPat.var("x") * UPat.cvar("c1")
+    do_compile(up)
+
+  def test_single(self):
+    up = UPat.var("x") + UPat.var("y")
+    do_compile(up)
+
+  def test_xpx(self):
+    up = UPat.var("x") + UPat.var("x")
+    do_compile(up)
+
+  def test_xp0(self):
+    up = UPat.var("x") + 0
+    do_compile(up)
+
+  def test_bool(self):
+    up = UPat.var('x', dtype=dtypes.bool) * UPat.var('y', dtype=dtypes.bool)
+    do_compile(up)
+
+  def test_single_c(self):
+    up = (UPat.var("x") + UPat.var("y")) * UPat.var("c")
+    do_compile(up)
+
+  def test_const_folding(self):
+    up = UPat(GroupOp.ALU-{Ops.THREEFRY}, name="a", src=UPat((Ops.CONST, Ops.STACK)))
+    do_compile(up)
+
+  def test_range_named(self):
+    # this should be one src, but this should also still work
+    up = UPat(Ops.CAST, dtypes.float, UPat.var("x", dtypes.bfloat16))
+    do_compile(up)
 
 if __name__ == '__main__':
   unittest.main(verbosity=2)

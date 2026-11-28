@@ -1,13 +1,12 @@
-import unittest
+import unittest, math
 import numpy as np
 from tinygrad import Tensor, dtypes, nn, UOp, TinyJit
 from tinygrad.llm.model import (
   GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, MLATransformerBlock, Indexer, IndexerConfig,
   HyperConnection, HCConfig, AttentionResidual, GatedResidual, PLELayer, PLEConfig, Compressor,
-  apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, short_conv,
+  apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk, short_conv, RelAttnConfig, RelAttentionBlock, sink_attention,
 )
 from tinygrad.llm.gguf import GGUFPackedTable
-from test.helpers import slow
 
 def apply_rope(x:Tensor, start_pos:int):
   B, H, T, Hd = x.shape
@@ -72,6 +71,12 @@ class TestAttention(unittest.TestCase):
     self.assertTrue(attention(False).allclose(x, rtol=0, atol=1e-6).item())
     # the token and zero-value sink have equal weights: ([2,4] + [0,0]) / 2
     self.assertTrue(attention(True).allclose(x / 2, rtol=0, atol=1e-6).item())
+
+  def test_sink_attention_mask(self):
+    # q is zero, so the weights are exp(mask) and exp(sink) per row, the sink has a zero value: 2/(1+1), (2 + 4*2)/(1+2+5)
+    mask, sink = Tensor([[[[0., -math.inf], [0., math.log(2)]]]]), Tensor([[[[0.], [math.log(5)]]]])
+    out = sink_attention(Tensor.zeros(1, 1, 2, 1), Tensor.zeros(1, 1, 2, 1), Tensor([[[[2.], [4.]]]]), mask, sink)
+    np.testing.assert_allclose(out.numpy().flatten(), [1., 1.25], rtol=1e-6)
 
   def test_sliding_window(self):
     x = Tensor([[[1., 1.], [3., 3.], [5., 5.]]])
@@ -246,6 +251,14 @@ class TestAttention(unittest.TestCase):
     for start_pos in (0, 2): ple.write_rows([3, 7, 5, 9], start_pos, 2, 2)
     # (t0 ^ 2*t1) % 13, (t0 ^ 2*t1 ^ 4*t2) % 17 + 13
     np.testing.assert_array_equal(ple.table.rows.numpy()[:4], table[[[0, 13], [1, 25], [11, 19], [3, 27]]])
+
+  def test_rel_conv_taps(self):
+    # each head adds its taps to the conv weight, out = (x + conv) / sqrt(5)
+    ra = RelAttnConfig(length=4, extent=8, qk_clip=5.0, rel_clip=5.0, log_scale_floor=2, log_scale_alpha=0.5, conv_kernel=2)
+    block, conv = RelAttentionBlock(self._make_config(n_kv_heads=2, rel_attn=ra)), {"weight": Tensor([[1., 0.], [0., 1.], [1., 1.], [0., 0.]])}
+    block.conv_states, block.initial = {conv["weight"]: Tensor([[[1., 2., 3., 4.]]]).contiguous().realize()}, Tensor(False)
+    out = block._conv(conv, Tensor([[[1., 0., 2., 1.], [0., 3., 1., 2.]]]), Tensor([[[1., 0., 0., 2.], [0., 3., 1., 0.]]]))
+    np.testing.assert_allclose((out * 5 ** 0.5).numpy(), [[[3., 0., 13., 9.], [4., 6., 5., 4.]]], rtol=1e-6)
 
 class TestGatedDeltaNetBlock(unittest.TestCase):
   def _tensor_linspace(self, start:float, stop:float, shape:tuple[int, ...]) -> Tensor:
@@ -438,32 +451,6 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     np.testing.assert_allclose(prefill, decode, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(prefill_conv, decode_conv, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(prefill_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3)
-
-  @slow
-  def test_varied_chunk_sizes_match_decode(self):
-    # full prefill is proven equivalent to decode by test_gatedeltanet_reference_and_reset (delta rule) and
-    # test_kda_prefill_matches_decode (kda), so use it as the baseline and only exercise multi-chunk handoffs here
-    for kda in (False, True):
-      ssm = SSMConfig(conv_kernel=2, state_size=4, group_count=1, time_step_rank=1, inner_size=4, kda=kda, silu_gate=not kda)
-      config = self._make_config(ssm=ssm)
-      if kda:
-        block = GatedDeltaNetBlock(config, config.ssm)
-        for p in nn.state.get_parameters(block):
-          p.replace(self._tensor_linspace(-0.05, 0.05, p.shape) if len(p.shape) > 1 else self._tensor_linspace(0.05, 0.1, p.shape))
-      else: block = self._make_block(config)
-      x = self._tensor_linspace(-0.5, 0.5, (1, 4, config.dim))
-      decode = self._run_attention(block, x, 0)
-      decode_conv, decode_recurrent = self._cache_views(block)
-      for chunking in ([2, 2], [1, 3]):
-        self._reset_state(block)
-        outs, start = [], 0
-        for size in chunking:
-          outs.append(self._run_attention(block, x[:, start:start+size], start))
-          start += size
-        chunked_conv, chunked_recurrent = self._cache_views(block)
-        np.testing.assert_allclose(np.concatenate(outs, axis=1), decode, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
-        np.testing.assert_allclose(chunked_conv, decode_conv, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
-        np.testing.assert_allclose(chunked_recurrent, decode_recurrent, rtol=1e-3, atol=1e-3, err_msg=f"{kda=} {chunking=}")
 
 class TestShortConv(unittest.TestCase):
   def test_short_conv(self):

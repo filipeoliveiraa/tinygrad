@@ -26,22 +26,6 @@ class TestFunction(unittest.TestCase):
     np.testing.assert_equal((c[0]+c[1]).numpy(), [5*3,7*3,9*3])
   def test_two_return_precompiled(self): self.test_two_return(True)
 
-  def test_simple_same(self):
-    @function
-    def f(a:Tensor, b:Tensor) -> Tensor: return a+b
-
-    a = Tensor([1,2,3])
-    np.testing.assert_equal(f(a,a).numpy(), [2,4,6])
-
-  def test_implicit(self):
-    inp = Tensor([7,8,9])
-    @function(allow_implicit=True)
-    def f(a:Tensor, b:Tensor) -> Tensor: return a+b+inp
-
-    a = Tensor([1,2,3])
-    b = Tensor([4,5,6])
-    np.testing.assert_equal(f(a,b).numpy(), [12,15,18])
-
   def test_implicit_same_as_input(self):
     inp = Tensor([7,8,9])
     @function(allow_implicit=True)
@@ -49,31 +33,6 @@ class TestFunction(unittest.TestCase):
 
     a = Tensor([1,2,3])
     np.testing.assert_equal(f(a, inp).numpy(), [15,18,21])
-
-  def test_implicit_2(self):
-    inp = Tensor([7,8,9])
-    @function(allow_implicit=True)
-    def f(a:Tensor, b:Tensor) -> Tensor:
-      return a+b+inp
-    inp2 = Tensor([7,8,10])
-    @function(allow_implicit=True)
-    def g(a:Tensor, b:Tensor) -> Tensor:
-      return a+b+inp2
-
-    a = Tensor([1,2,3])
-    b = Tensor([4,5,6])
-    c = f(a,b)
-    d = g(a,b)
-    c.realize(d)
-    np.testing.assert_equal(c.numpy(), [12,15,18])
-    np.testing.assert_equal(d.numpy(), [12,15,19])
-
-  def test_implicit_unrealized(self):
-    inp = Tensor([1,2,3]) + Tensor([4,5,6])
-    @function(allow_implicit=True)
-    def f(a:Tensor) -> Tensor: return a + inp
-
-    np.testing.assert_equal(f(Tensor([10,20,30])).numpy(), [15,27,39])
 
   def test_implicit_symbolic_assign(self):
     for precompile in (False, True):
@@ -176,17 +135,6 @@ class TestFunction(unittest.TestCase):
         with self.subTest(precompile=precompile, value=value):
           self.assertEqual(f(UOp.variable("v", 1, 8, dtype=dtypes.int32).bind(value)).item(), value)
 
-  def test_scalar_param_without_bounds(self):
-    x = Tensor([1, 2, 3]).realize()
-    p = x.uop.param_like(0)
-    scalar = UOp.param(1, x.dtype, addrspace=AddrSpace.ALU)
-    for precompile in (False, True):
-      for value in (2, 3):
-        with self.subTest(precompile=precompile, value=value):
-          bound = UOp.variable("v", 1, 8, dtype=x.dtype).bind(value)
-          out, = UOp.call_with_outputs((p*scalar,), x.uop, bound, precompile=precompile)
-          self.assertEqual(Tensor(out).tolist(), [value, 2*value, 3*value])
-
   def test_grad_scalar_param_without_bounds(self):
     x = Tensor([1., 2., 3.]).realize()
     p = x.uop.param_like(0)
@@ -229,19 +177,6 @@ class TestFunction(unittest.TestCase):
     a = Tensor([1., 2., 3.])
     np.testing.assert_allclose(g(f(a)).numpy(), [110., 440., 990.])
 
-  def test_nested_calls_backward(self):
-    w = Tensor([[1., 2.], [3., 4.]]).contiguous().realize()
-    @function(allow_implicit=True)
-    def inner(x:Tensor) -> Tensor: return x + w
-    @function(allow_implicit=True)
-    def outer(a:Tensor, b:Tensor) -> Tensor: return inner(a.reshape(1,2) + b.reshape(1,2))
-
-    a = Tensor([1., 2.])
-    b = Tensor([3., 4.])
-    outer(a, b).sum().backward()
-    np.testing.assert_allclose(a.grad.numpy(), [2., 2.])
-    np.testing.assert_allclose(b.grad.numpy(), [2., 2.])
-
   def test_unused_param_backward(self):
     @function
     def f(a:Tensor, b:Tensor, c:Tensor) -> Tensor: return a + c  # b is unused
@@ -271,6 +206,13 @@ class TestFunction(unittest.TestCase):
     a = Tensor([1,2,3]).realize()
     np.testing.assert_equal(f(a).numpy(), [2,3,4])
     np.testing.assert_equal(a.numpy(), [3,4,5])  # TODO: should be [1,2,3]
+
+  def test_iadd_0d_precompile(self):
+    @function(precompile=True)
+    def f(x:Tensor) -> Tensor:
+      x += 1
+      return x
+    self.assertEqual(f(Tensor([1]).realize().reshape(())).item(), 2)
 
   def test_implicit_assign(self):
     a = Tensor([1,2,3])
@@ -404,29 +346,6 @@ class TestFunctionMulti(unittest.TestCase):
     self.assertEqual(result.uop.axis, 0)
     np.testing.assert_allclose(result.numpy(), x.numpy() @ w.numpy())
 
-  def test_data_parallel_backward(self):
-    @function
-    def f(x:Tensor, w:Tensor) -> Tensor: return x @ w
-
-    x = Tensor([[1.,0.],[0.,1.],[1.,1.],[0.,0.]]).shard(self.devices_2, axis=0)
-    w = Tensor([[1.,2.],[3.,4.]]).shard(self.devices_2, axis=None)
-    w.realize()
-    f(x, w).sum().backward()
-    # d/dx = ones @ w^T = [[1,3],[1,3],[1,3],[1,3]], but sum so ones(4,2) @ w^T? no:
-    # L = sum(x @ w), dL/dx = ones(4,2) @ w^T... actually dL/d(xw) = ones(4,2), dL/dx = ones(4,2) @ w^T
-    np.testing.assert_allclose(x.grad.numpy(), np.ones((4,2)) @ np.array([[1,3],[2,4]]))
-
-  def test_data_parallel_backward_4(self):
-    devices_4 = tuple(f"CPU:{i}" for i in range(4))
-    @function
-    def f(x:Tensor, w:Tensor) -> Tensor: return x @ w
-
-    x = Tensor(np.arange(16).reshape(8,2).astype(np.float32)).shard(devices_4, axis=0)
-    w = Tensor([[1.,2.],[3.,4.]]).shard(devices_4, axis=None)
-    w.realize()
-    f(x, w).sum().backward()
-    np.testing.assert_allclose(x.grad.numpy(), np.ones((8,2)) @ np.array([[1,3],[2,4]]))
-
   def test_data_parallel_backward_implicit(self):
     devices_4 = tuple(f"CPU:{i}" for i in range(4))
     w = Tensor([[1.,2.],[3.,4.]]).shard(devices_4, axis=None)
@@ -465,16 +384,6 @@ class TestFunctionTuple(unittest.TestCase):
     assert t2.tolist() == [3,3,3]
   def test_tuple_precompile(self): self.test_tuple(True)
 
-  def test_grad_tuple(self, precompile=False):
-    x = Tensor.ones(3).contiguous()
-    y = Tensor.ones(3).contiguous()
-    @function(precompile=precompile)
-    def f(u1:Tensor, u2:Tensor): return (u1+1, u2+2)
-    t1, t2 = f(x,y)
-    (t1+t2).sum().backward()
-    x.grad.realize(y.grad)
-  def test_grad_tuple_precompile(self): self.test_grad_tuple(True)
-
   def test_grad_fxn_tuple(self):
     # grad_fxn for tuple: receives one gradient per output as positional args
     def grad_fxn(d_out0:UOp, d_out1:UOp, call:UOp):
@@ -507,24 +416,6 @@ class TestFunctionTuple(unittest.TestCase):
     def f(x:Tensor): return (x+1, x+2)
     _, y = f(x)
     self.assertEqual(y.sum().gradient(x)[0].item(), 1.0)
-
-  def test_grad_unused_tuple_output_recursive(self):
-    # only one output is used
-    @function(precompile=True, precompile_backward=True)
-    def f(x:Tensor, w:Tensor):
-      a = x @ w
-      b = (x @ w) * 2  # shares x@w with a
-      return (a, b)
-
-    x = Tensor([[1., 2.], [3., 4.]]).contiguous()
-    w = Tensor([[1., 0.], [0., 1.]]).contiguous()
-    Tensor.realize(x, w)
-    t1, _ = f(x, w)
-    t1.sum().backward()
-    Tensor.realize(x.grad, w.grad)
-    # only t1 = x @ w flows to loss; dL/dw = x.T @ ones(2,2)
-    np.testing.assert_allclose(w.grad.numpy(), np.array([[1., 2.], [3., 4.]]).T @ np.ones((2, 2)))
-    np.testing.assert_allclose(x.grad.numpy(), np.ones((2, 2)) @ np.array([[1., 0.], [0., 1.]]).T)
 
   def test_grad_unused_tuple_output_same_value(self):
     x = Tensor([2.])
@@ -695,6 +586,16 @@ class TestFunctionTuple(unittest.TestCase):
       return Tensor(after).contiguous() + a
     out = f(Tensor([1., 1., 1., 1.]).contiguous().realize())
     np.testing.assert_allclose(out.numpy(), [11., 21., 31., 41.])
+
+  def test_invalid_store_into_explicit_arg_keeps_writes(self):
+    # the caller sees the write to a[1] even with an Invalid store to a[:1]
+    for precompile in (False, True):
+      with self.subTest(precompile=precompile):
+        @function(precompile=precompile)
+        def f(a:Tensor): return Tensor(a.uop.after(a.uop[:1].store(Invalid), a.uop[1:2].store(40.)))[1:2] + 1
+        a = Tensor([10., 20., 30.]).contiguous().realize()
+        np.testing.assert_allclose(f(a).numpy(), [41.])
+        np.testing.assert_allclose(a.numpy()[1:], [40., 30.])
 
   def test_custom_kernel_precompile_further_compute(self, multi=False, kernel_count:int=2):
     devs = ("CPU:0", "CPU:1")

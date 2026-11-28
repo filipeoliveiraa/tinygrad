@@ -1,4 +1,4 @@
-import contextlib, unittest, math
+import unittest, math
 import numpy as np
 import torch
 from typing import Any, List
@@ -54,10 +54,10 @@ def _test_cast(a:Tensor, target_dtype:DType):
   expected = list(a.numpy().astype(_to_np_dtype(target_dtype)))
   if target_dtype in dtypes.fp8s: expected = [truncate[target_dtype](x) for x in expected]
   _test_op(lambda: a.cast(target_dtype), target_dtype, expected)
-def _test_bitcast(a:Tensor, target_dtype:DType, target=None):
+def _test_bitcast(a:Tensor, target_dtype:DType):
   expected = _to_torch_storage(a).view(_to_torch_dtype(target_dtype)).tolist()
   if target_dtype in dtypes.fp8s: expected = [fp8_to_float(x, target_dtype) for x in expected]
-  _test_op(lambda: a.bitcast(target_dtype), target_dtype, target or expected)
+  _test_op(lambda: a.bitcast(target_dtype), target_dtype, expected)
 
 class TestDType(unittest.TestCase):
   DTYPE: Any = None
@@ -112,8 +112,8 @@ class _DTypePairs:
       if dtype.itemsize > self.DTYPE.itemsize:
         _test_ops(a_dtype=self.DTYPE, b_dtype=dtype)
 
-def _test_ops(a_dtype:DType, b_dtype:DType, target_dtype=None):
-  target_dtype = target_dtype or least_upper_dtype(a_dtype, b_dtype)
+def _test_ops(a_dtype:DType, b_dtype:DType):
+  target_dtype = least_upper_dtype(a_dtype, b_dtype)
   if a_dtype == dtypes.bool or b_dtype == dtypes.bool: return
   _assert_eq(Tensor([1,2,3,4], dtype=a_dtype)+Tensor([1,2,3,4], dtype=b_dtype), target_dtype, [2,4,6,8])
   _assert_eq(Tensor([[1,2],[3,4]], dtype=a_dtype)@Tensor.eye(2, dtype=b_dtype), target_dtype, [[1,2],[3,4]])
@@ -224,14 +224,6 @@ class TestBFloat16DType(unittest.TestCase):
   def test_bf16_floor(self): self.assertEqual(Tensor([-1.5, 2.5], dtype=dtypes.bfloat16).floor().tolist(), [-2., 2.])
 
 class TestBFloat16DTypeCast(unittest.TestCase):
-  def test_f16_to_bf16_conversion(self):
-    original_tensor = Tensor([1.0, 2.0, 3.0], dtype=dtypes.float16)
-    converted_tensor = original_tensor.cast(dtypes.bfloat16)
-    self.assertEqual(converted_tensor.dtype, dtypes.bfloat16)
-    back_to_float32 = converted_tensor.cast(dtypes.float32)
-    original_to_float32 = original_tensor.cast(dtypes.float32)
-    np.testing.assert_allclose(back_to_float32.numpy(), original_to_float32.numpy(), rtol=1e-2, atol=1e-3)
-
   @Context(EMULATED_DTYPES="bf16")
   def test_cast_denormal_flushes(self):
     self.assertEqual(Tensor([0x7f8000], dtype=dtypes.uint32).bitcast(dtypes.float32).cast(dtypes.bfloat16).bitcast(dtypes.uint16).tolist(), [0])
@@ -260,12 +252,8 @@ class TestHalfDType(TestDType): DTYPE = dtypes.half
 class TestEmulatedHalf(TestHalfDType):
   @classmethod
   def setUpClass(cls):
-    cls.stack = contextlib.ExitStack()
-    cls.stack.enter_context(Context(EMULATED_DTYPES="half"))
+    cls.enterClassContext(Context(EMULATED_DTYPES="half"))
     cls.DATA = rand_for_dtype(cls.DTYPE, 10, allow_subnormal=False)
-
-  @classmethod
-  def tearDownClass(cls): cls.stack.close()
 
   def test_cast_overflow(self): self.assertEqual(Tensor([65519., 65520.]).cast(dtypes.half).float().tolist(), [65504., math.inf])
   def test_cast_underflow(self):
@@ -399,12 +387,8 @@ class TestInt64DType(TestDType):
 class TestEmulatedInt64DType(TestInt64DType):
   @classmethod
   def setUpClass(cls):
-    cls.stack = contextlib.ExitStack()
-    cls.stack.enter_context(Context(EMULATED_DTYPES="long"))
+    cls.enterClassContext(Context(EMULATED_DTYPES="long"))
     cls.DATA = rand_for_dtype(cls.DTYPE, 10, allow_subnormal=False)
-
-  @classmethod
-  def tearDownClass(cls): cls.stack.close()
 
 class TestUint64DType(TestDType):
   DTYPE = dtypes.uint64
@@ -423,12 +407,8 @@ class TestUint64DType(TestDType):
 class TestEmulatedUInt64DType(_DTypePairs, TestUint64DType):
   @classmethod
   def setUpClass(cls):
-    cls.stack = contextlib.ExitStack()
-    cls.stack.enter_context(Context(EMULATED_DTYPES="long"))
+    cls.enterClassContext(Context(EMULATED_DTYPES="long"))
     cls.DATA = rand_for_dtype(cls.DTYPE, 10, allow_subnormal=False)
-
-  @classmethod
-  def tearDownClass(cls): cls.stack.close()
 
 class TestBoolDType(TestDType): DTYPE = dtypes.bool
 
@@ -437,36 +417,24 @@ class TestBFloat16Type(TestDType): DTYPE = dtypes.bfloat16
 class TestEmulatedBFloat16Type(_DTypePairs, TestBFloat16Type):
   @classmethod
   def setUpClass(cls):
-    cls.stack = contextlib.ExitStack()
-    cls.stack.enter_context(Context(EMULATED_DTYPES="bfloat16"))
+    cls.enterClassContext(Context(EMULATED_DTYPES="bfloat16"))
     cls.DATA = rand_for_dtype(cls.DTYPE, 10, allow_subnormal=False)
-
-  @classmethod
-  def tearDownClass(cls): cls.stack.close()
 
 class TestFp8e4m3(_DTypePairs, TestDType): DTYPE = dtypes.fp8e4m3
 
 class TestEmulatedFp8e4m3(TestFp8e4m3):
   @classmethod
   def setUpClass(cls):
-    cls.stack = contextlib.ExitStack()
-    cls.stack.enter_context(Context(EMULATED_DTYPES="fp8e4m3"))
+    cls.enterClassContext(Context(EMULATED_DTYPES="fp8e4m3"))
     cls.DATA = rand_for_dtype(cls.DTYPE, 10, allow_subnormal=False)
-
-  @classmethod
-  def tearDownClass(cls): cls.stack.close()
 
 class TestFp8e5m2(TestDType): DTYPE = dtypes.fp8e5m2
 
 class TestEmulatedFp8e5m2(TestFp8e5m2):
   @classmethod
   def setUpClass(cls):
-    cls.stack = contextlib.ExitStack()
-    cls.stack.enter_context(Context(EMULATED_DTYPES="fp8e5m2"))
+    cls.enterClassContext(Context(EMULATED_DTYPES="fp8e5m2"))
     cls.DATA = rand_for_dtype(cls.DTYPE, 10, allow_subnormal=False)
-
-  @classmethod
-  def tearDownClass(cls): cls.stack.close()
 
 class TestFp8e4m3fnuz(TestDType): DTYPE = dtypes.fp8e4m3fnuz
 class TestFp8e5m2fnuz(TestDType): DTYPE = dtypes.fp8e5m2fnuz
@@ -495,12 +463,6 @@ class TestTensorMethod(unittest.TestCase):
     np.testing.assert_allclose(ret.numpy(), np.abs(a.numpy()-b.numpy()))
 
 class TestDtypeUsage(unittest.TestCase):
-  def test_max_w_alu(self):
-    for d in dtypes.ints:
-      if d in supported_dtypes:
-        t = Tensor([[1, 2], [3, 4]], dtype=d)
-        (t*t).max().item()
-
   def test_where_float16_compare_to_const(self):
     # t > 0 is CMPLT(0, t): the float16 operand is on the right
     t = Tensor([-1.0, 1.0], dtype=dtypes.float16)

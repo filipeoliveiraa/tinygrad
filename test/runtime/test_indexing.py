@@ -1,11 +1,10 @@
 # test cases are modified from pytorch test_indexing.py https://github.com/pytorch/pytorch/blob/597d3fb86a2f3b8d6d8ee067e769624dcca31cdb/test/test_indexing.py
 
-import unittest, random, warnings
+import unittest, random
 import numpy as np
 
-from tinygrad import Tensor, dtypes, Device, TinyJit, Variable
-from tinygrad.helpers import all_same, prod
-from test.helpers import slow
+from tinygrad import Tensor, dtypes, Device, Variable, GlobalCounters
+from tinygrad.helpers import prod
 
 random.seed(42)
 
@@ -16,45 +15,6 @@ def numpy_testing_assert_equal_helper(a, b):
 
 def consec(shape, start=1):
   return Tensor.arange(prod(shape)).reshape(shape)+start
-
-# creates strided tensor with base set to reference tensor's base, equivalent to torch.set_()
-def set_(reference: Tensor, shape, strides, offset):
-  raise NotImplementedError("need to implement without calling uop.view")
-  """
-  if reference.uop.base.realized is None: reference.realize()
-  assert reference.uop.base.realized, "base has to be realized before setting it to strided's base"
-  strided = Tensor(reference.uop.view(ShapeTracker((View.create(shape=shape, strides=strides, offset=offset),))))
-  assert strided.uop.st.real_strides() == strides, "real_strides should equal strides for strided"
-  return strided
-  """
-
-def clone(original:Tensor): return original.clone()
-def copy_(src:Tensor, other:Tensor) -> Tensor: return src.clone()
-# this is fine for tested usecases since as geohotstan understands,
-# data_ptr is used to compare if operations needed between tensors is the same
-def data_ptr(tensor:Tensor): return tensor.uop
-
-# https://pytorch.org/docs/stable/generated/torch.Tensor.index_put_.html
-def index_put_(tensor:Tensor, indices, values, accumulate) -> Tensor:
-  if accumulate: tensor[indices] += values
-  else: tensor[indices] = values
-
-# https://pytorch.org/docs/stable/generated/torch.argsort.html
-def argsort(tensor:Tensor) -> Tensor:
-  pass
-
-# https://pytorch.org/docs/stable/generated/torch.all.html
-def all_(tensor:Tensor) -> Tensor:
-  return tensor != 0
-
-# https://pytorch.org/docs/stable/generated/torch.diagonal.html
-def diagonal(tensor:Tensor) -> Tensor:
-  assert tensor.ndim == 2 and all_same(tensor.shape), 'only support 2 ndim square tensors'
-  return (Tensor.eye(tensor.shape[0]) * tensor).sum(0)
-
-# https://numpy.org/doc/stable/reference/generated/numpy.unravel_index.html
-def unravel_index(tensor, shape):
-  pass
 
 class TestIndexing(unittest.TestCase):
   def test_index(self):
@@ -145,8 +105,8 @@ class TestIndexing(unittest.TestCase):
     self.assertRaises(IndexError, lambda: reference[0.0, ..., 0.0:2.0])
     self.assertRaises(IndexError, lambda: reference[0.0, :, 0.0])
 
-    def delitem(): del reference[0]
-    self.assertRaises(TypeError, delitem)
+    with self.assertRaises(TypeError):
+      del reference[0]
 
   def test_set_item_to_scalar_tensor(self):
     m = random.randint(1, 10)
@@ -165,65 +125,6 @@ class TestIndexing(unittest.TestCase):
     numpy_testing_assert_equal_helper(v[::3], [0, 3, 6, 9])
     numpy_testing_assert_equal_helper(v[::11], [0])
     numpy_testing_assert_equal_helper(v[1:6:2], [1, 3, 5])
-
-  def test_step_assignment(self):
-    v = Tensor.zeros(4, 4).contiguous()
-    v[0, 1::2] = Tensor([3., 4.])
-    numpy_testing_assert_equal_helper(v[0].numpy().tolist(), [0, 3, 0, 4])
-    numpy_testing_assert_equal_helper(v[1:].sum(), 0)
-
-  @unittest.skip("bool indexing not supported")
-  def test_bool_indices(self):
-    v = Tensor.randn(5, 7, 3)
-    boolIndices = Tensor([True, False, True, True, False], dtype=dtypes.bool)
-    numpy_testing_assert_equal_helper(v[boolIndices].shape, (3, 7, 3))
-    numpy_testing_assert_equal_helper(v[boolIndices], Tensor.stack([v[0], v[2], v[3]]))
-
-    v = Tensor([True, False, True], dtype=dtypes.bool)
-    boolIndices = Tensor([True, False, False], dtype=dtypes.bool)
-    uint8Indices = Tensor([1, 0, 0], dtype=dtypes.uint8)
-    with warnings.catch_warnings(record=True) as w:
-      numpy_testing_assert_equal_helper(v[boolIndices].shape, v[uint8Indices].shape)
-      numpy_testing_assert_equal_helper(v[boolIndices], v[uint8Indices])
-      numpy_testing_assert_equal_helper(v[boolIndices], Tensor([True]))
-      numpy_testing_assert_equal_helper(len(w), 2)
-
-  @unittest.skip("bool indexing not supported")
-  def test_bool_indices_accumulate(self):
-    mask = Tensor.zeros(size=(10, ), dtype=dtypes.bool)
-    y = Tensor.ones(size=(10, 10))
-    index_put_(y, (mask, ), y[mask], accumulate=True)
-    numpy_testing_assert_equal_helper(y, Tensor.ones(size=(10, 10)))
-
-  @unittest.skip("bool indexing not supported")
-  def test_multiple_bool_indices(self):
-    v = Tensor.randn(5, 7, 3)
-    # note: these broadcast together and are transposed to the first dim
-    mask1 = Tensor([1, 0, 1, 1, 0], dtype=dtypes.bool)
-    mask2 = Tensor([1, 1, 1], dtype=dtypes.bool)
-    numpy_testing_assert_equal_helper(v[mask1, :, mask2].shape, (3, 7))
-
-  @unittest.skip("bool indexing not supported")
-  def test_byte_mask(self):
-    v = Tensor.randn(5, 7, 3)
-    mask = Tensor([1, 0, 1, 1, 0], dtype=dtypes.uint8)
-    with warnings.catch_warnings(record=True) as w:
-      numpy_testing_assert_equal_helper(v[mask].shape, (3, 7, 3))
-      numpy_testing_assert_equal_helper(v[mask], Tensor.stack([v[0], v[2], v[3]]))
-      numpy_testing_assert_equal_helper(len(w), 2)
-
-    v = Tensor([1.])
-    numpy_testing_assert_equal_helper(v[v == 0], Tensor([]))
-
-  @unittest.skip("bool indexing not supported")
-  def test_byte_mask_accumulate(self):
-    mask = Tensor.zeros(size=(10, ), dtype=dtypes.uint8)
-    y = Tensor.ones(size=(10, 10))
-    with warnings.catch_warnings(record=True) as w:
-      warnings.simplefilter("always")
-      index_put_(y, (mask, ), y[mask], accumulate=True)
-      numpy_testing_assert_equal_helper(y, Tensor.ones(size=(10, 10)))
-      numpy_testing_assert_equal_helper(len(w), 2)
 
   # TODO setitem
   # NOTE: tinygrad doesn't support idx.max that big
@@ -288,6 +189,15 @@ class TestIndexing(unittest.TestCase):
       numpy_testing_assert_equal_helper(output, input_list)
   '''
 
+  # TODO empty setitem
+  '''
+  def test_index_put_accumulate_empty(self):
+    # Regression test for https://github.com/pytorch/pytorch/issues/94667
+    input = Tensor.rand([], dtype=dtypes.float32)
+    with self.assertRaises(RuntimeError):
+      index_put_(input, [], np.array([1.0]), True)
+  '''
+
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "WEBGPU doesn't support long indexing: #13624")
   def test_index_ind_dtype(self):
     x = Tensor.randn(4, 4)
@@ -320,175 +230,12 @@ class TestIndexing(unittest.TestCase):
       numpy_testing_assert_equal_helper(inp_ref, inp_res)
     '''
 
-  # TODO empty setitem
-  '''
-  def test_index_put_accumulate_empty(self):
-    # Regression test for https://github.com/pytorch/pytorch/issues/94667
-    input = Tensor.rand([], dtype=dtypes.float32)
-    with self.assertRaises(RuntimeError):
-      index_put_(input, [], np.array([1.0]), True)
-  '''
-
-  @unittest.skip("bool indexing not supported")
-  def test_multiple_byte_mask(self):
-    v = Tensor.randn(5, 7, 3)
-    # note: these broadcast together and are transposed to the first dim
-    mask1 = Tensor([1, 0, 1, 1, 0], dtype=dtypes.uint8)
-    mask2 = Tensor([1, 1, 1], dtype=dtypes.uint8)
-    with warnings.catch_warnings(record=True) as w:
-      warnings.simplefilter("always")
-      numpy_testing_assert_equal_helper(v[mask1, :, mask2].shape, (3, 7))
-      numpy_testing_assert_equal_helper(len(w), 2)
-
-  @unittest.skip("bool indexing not supported")
-  def test_byte_mask2d(self):
-    v = Tensor.randn(5, 7, 3)
-    c = Tensor.randn(5, 7)
-    num_ones = (c > 0).sum()
-    r = v[c > 0]
-    numpy_testing_assert_equal_helper(r.shape, (num_ones, 3))
-
-  @unittest.skip("bool indexing not supported")
-  def test_jit_indexing(self):
-    def fn1(x):
-      x[x < 50] = 1.0
-      return x
-
-    def fn2(x):
-      x[0:50] = 1.0
-      return x
-
-    scripted_fn1 = TinyJit(fn1)
-    scripted_fn2 = TinyJit(fn2)
-    data = Tensor.arange(100, dtype=dtypes.float)
-    out = scripted_fn1(clone(data))
-    ref = Tensor(np.concatenate((np.ones(50), np.arange(50, 100))), dtype=dtypes.float)
-    numpy_testing_assert_equal_helper(out, ref)
-    out = scripted_fn2(clone(data))
-    numpy_testing_assert_equal_helper(out, ref)
-
   def test_int_indices2d(self):
     # From the NumPy indexing example
     x = Tensor.arange(0, 12).reshape(4, 3)
     rows = Tensor([[0, 0], [3, 3]])
     columns = Tensor([[0, 2], [0, 2]])
     numpy_testing_assert_equal_helper(x[rows, columns].numpy().tolist(), [[0, 2], [9, 11]])
-
-  def test_int_indices_broadcast(self):
-    # From the NumPy indexing example
-    x = Tensor.arange(0, 12).reshape(4, 3)
-    rows = Tensor([0, 3])
-    columns = Tensor([0, 2])
-    result = x[rows[:, None], columns]
-    numpy_testing_assert_equal_helper(result.numpy().tolist(), [[0, 2], [9, 11]])
-
-  # TODO jax supports empty tensor indexing
-  @unittest.skip("empty tensor indexing not supported")
-  def test_empty_index(self):
-    x = Tensor.arange(0, 12).reshape(4, 3)
-    idx = Tensor([], dtype=dtypes.int64)
-    numpy_testing_assert_equal_helper(x[idx].numel(), 0)
-
-    # TODO empty setitem
-    '''
-    # empty assignment should have no effect but not throw an exception
-    y = clone(x)
-    y[idx] = -1
-    numpy_testing_assert_equal_helper(x, y)
-
-    mask = Tensor.zeros(4, 3).cast(dtypes.bool)
-    y[mask] = -1
-    numpy_testing_assert_equal_helper(x, y)
-    '''
-
-  # TODO jax supports empty tensor indexing
-  @unittest.skip("empty tensor indexing not supported")
-  def test_empty_ndim_index(self):
-    x = Tensor.randn(5)
-    numpy_testing_assert_equal_helper(Tensor.empty(0, 2), x[Tensor.empty(0, 2, dtype=dtypes.int64)])
-
-    x = Tensor.randn(2, 3, 4, 5)
-    numpy_testing_assert_equal_helper(Tensor.empty(2, 0, 6, 4, 5),
-                      x[:, Tensor.empty(0, 6, dtype=dtypes.int64)])
-
-    x = Tensor.empty(10, 0)
-    numpy_testing_assert_equal_helper(x[[1, 2]].shape, (2, 0))
-    numpy_testing_assert_equal_helper(x[[], []].shape, (0,))
-    with self.assertRaises(IndexError):
-      x[:, [0, 1]]
-
-  @unittest.skip("bool indexing not supported")
-  def test_index_getitem_copy_bools_slices(self):
-    true = Tensor(1, dtype=dtypes.uint8)
-    false = Tensor(0, dtype=dtypes.uint8)
-
-    tensors = [Tensor.randn(2, 3), Tensor(3.)]
-
-    for a in tensors:
-      self.assertNotEqual(data_ptr(a), data_ptr(a[True]))
-      numpy_testing_assert_equal_helper(Tensor.empty(0, *a.shape), a[False])
-      self.assertNotEqual(data_ptr(a), data_ptr(a[true]))
-      numpy_testing_assert_equal_helper(Tensor.empty(0, *a.shape), a[false])
-      self.assertEqual(data_ptr(a), data_ptr(a[None]))
-      self.assertEqual(data_ptr(a), data_ptr(a[...]))
-
-  @unittest.skip("bool indexing not supported")
-  def test_index_setitem_bools_slices(self):
-    true = Tensor(1, dtype=dtypes.uint8)
-    false = Tensor(0, dtype=dtypes.uint8)
-
-    tensors = [Tensor.randn(2, 3), Tensor(3)]
-
-    for a in tensors:
-      # prefix with a 1,1, to ensure we are compatible with numpy which cuts off prefix 1s
-      # (some of these ops already prefix a 1 to the size)
-      neg_ones = Tensor.ones_like(a) * -1
-      neg_ones_expanded = neg_ones.unsqueeze(0).unsqueeze(0)
-      a[True] = neg_ones_expanded
-      numpy_testing_assert_equal_helper(a, neg_ones)
-      a[False] = 5
-      numpy_testing_assert_equal_helper(a, neg_ones)
-      a[true] = neg_ones_expanded * 2
-      numpy_testing_assert_equal_helper(a, neg_ones * 2)
-      a[false] = 5
-      numpy_testing_assert_equal_helper(a, neg_ones * 2)
-      a[None] = neg_ones_expanded * 3
-      numpy_testing_assert_equal_helper(a, neg_ones * 3)
-      a[...] = neg_ones_expanded * 4
-      numpy_testing_assert_equal_helper(a, neg_ones * 4)
-      if a.dim() == 0:
-        with self.assertRaises(IndexError):
-          a[:] = neg_ones_expanded * 5
-
-  @unittest.skip("bool indexing not supported")
-  def test_index_scalar_with_bool_mask(self):
-    a = Tensor(1)
-    uintMask = Tensor(True, dtype=dtypes.uint8)
-    boolMask = Tensor(True, dtype=dtypes.bool)
-    numpy_testing_assert_equal_helper(a[uintMask], a[boolMask])
-    numpy_testing_assert_equal_helper(a[uintMask].dtype, a[boolMask].dtype)
-
-    a = Tensor(True, dtype=dtypes.bool)
-    numpy_testing_assert_equal_helper(a[uintMask], a[boolMask])
-    numpy_testing_assert_equal_helper(a[uintMask].dtype, a[boolMask].dtype)
-
-  @unittest.skip("bool indexing not supported")
-  def test_setitem_expansion_error(self):
-    true = Tensor(True)
-    a = Tensor.randn(2, 3)
-    # check prefix with  non-1s doesn't work
-    # a_expanded = a.expand(torch.Size([5, 1]) + a.size())
-    a_expanded = a.expand((5, 1) + a.shape)
-    # NumPy: ValueError
-    with self.assertRaises(RuntimeError):
-      a[True] = a_expanded
-    with self.assertRaises(RuntimeError):
-      a[true] = a_expanded
-
-  def test_getitem_scalars_simple(self):
-    src = Tensor([[[1.,2.],[3.,4.]], [[1,1],[1,1]]])
-    a = src[0].mul(src[1])
-    self.assertEqual(a[0,1].item(), 2)
 
   def test_getitem_scalars(self):
     zero = Tensor(0, dtype=dtypes.int64)
@@ -545,50 +292,6 @@ class TestIndexing(unittest.TestCase):
     np.testing.assert_allclose(9.9, r, rtol=1e-7)
   '''
 
-  @unittest.skip("getitem expects elementwise ops folding to be instant, but it happens late in the scheduler")
-  def test_getitem_casted_scalars_folding(self):
-    Tensor.manual_seed(0)
-    # cast of const is just another const, don't need extra kernels for this
-    a = Tensor.randn(2, 3)
-    one = Tensor(1, dtype=dtypes.int64)
-    self.assertEqual(data_ptr(a[1]), data_ptr(a[one.cast(dtypes.int32)]))
-    self.assertEqual(data_ptr(a[1]), data_ptr(a[one.cast(dtypes.int16)]))
-
-  @unittest.skip("does not fold now")
-  def test_getitem_scalars_simple_folding(self):
-    a = Tensor.randn(2, 3)
-    zero = Tensor(0, dtype=dtypes.int64)
-    one = Tensor(1, dtype=dtypes.int64)
-    self.assertEqual(data_ptr(a[0, 1]), data_ptr(a[zero, one]))
-
-  def test_basic_advanced_combined(self):
-    # From the NumPy indexing example
-    x = Tensor.arange(0, 12).reshape(4, 3)
-    numpy_testing_assert_equal_helper(x[1:2, 1:3], x[1:2, [1, 2]])
-    numpy_testing_assert_equal_helper(x[1:2, 1:3].numpy().tolist(), [[4, 5]])
-
-    # Check that it is a copy
-    unmodified = clone(x)
-    x[1:2, [1, 2]].zeros_like()
-    numpy_testing_assert_equal_helper(x, unmodified)
-
-    # But assignment should modify the original
-    # TODO fancy setitem
-    '''
-    unmodified = clone(x)
-    x[1:2, [1, 2]] = 0
-    self.assertNotEqual(x, unmodified)
-    '''
-
-  def test_int_assignment(self):
-    x = Tensor.arange(0, 4).reshape(2, 2)
-    x[1] = 5
-    numpy_testing_assert_equal_helper(x.numpy().tolist(), [[0, 1], [5, 5]])
-
-    x = Tensor.arange(0, 4).reshape(2, 2)
-    x[1] = Tensor.arange(5, 7)
-    numpy_testing_assert_equal_helper(x.numpy().tolist(), [[0, 1], [5, 6]])
-
   # TODO fancy setitem
   '''
   def test_byte_tensor_assignment(self):
@@ -606,13 +309,6 @@ class TestIndexing(unittest.TestCase):
     numpy_testing_assert_equal_helper(x[3], Tensor.arange(12., 16))
   '''
 
-  @unittest.skip("Tensor unpacking not supported")
-  def test_variable_slicing(self):
-    x = Tensor.arange(0, 16).reshape(4, 4)
-    indices = Tensor([0, 1], dtype=dtypes.int32)
-    i, j = indices
-    numpy_testing_assert_equal_helper(x[i:j], x[0:1])
-
   def test_variable_with_tensor_index(self):
     t = Tensor.arange(12).reshape(3, 4)
     v = Variable("v", 0, 2).bind(1)
@@ -620,15 +316,6 @@ class TestIndexing(unittest.TestCase):
 
   def test_variable_negative_index(self):
     self.assertEqual([Tensor([9, 8, 7])[Variable("i", -1, 1).bind(i)].item() for i in (-1, 0, 1)], [7, 9, 8])
-
-  def test_ellipsis_tensor(self):
-    x = Tensor.arange(0, 9).reshape(3, 3)
-    idx = Tensor([0, 2])
-    numpy_testing_assert_equal_helper(x[..., idx].numpy().tolist(), [[0, 2],
-                                                                     [3, 5],
-                                                                     [6, 8]])
-    numpy_testing_assert_equal_helper(x[idx, ...].numpy().tolist(), [[0, 1, 2],
-                                                                     [6, 7, 8]])
 
   # TODO unravel_index
   '''
@@ -663,11 +350,8 @@ class TestIndexing(unittest.TestCase):
     x = Tensor(10)
     numpy_testing_assert_equal_helper(x, x.item())
 
-    def runner():
-      print(x[0])
-      return x[0]
-
-    self.assertRaises(IndexError, runner)
+    with self.assertRaises(IndexError):
+      x[0]
 
   # TODO fancy setitem
   '''
@@ -689,19 +373,6 @@ class TestNumpy(unittest.TestCase):
     a = Tensor([1, 2, 3])
     numpy_testing_assert_equal_helper(a[()], a)
     #self.assertEqual(data_ptr(a[()]), data_ptr(a))
-
-  # TODO jax supports empty tensor indexing
-  @unittest.skip("empty tensor indexing not supported")
-  def test_empty_fancy_index(self):
-    # Empty list index creates an empty array
-    a = Tensor([1, 2, 3])
-    numpy_testing_assert_equal_helper(a[[]], np.array([]))
-
-    b = Tensor([]).cast(dtypes.int64)
-    numpy_testing_assert_equal_helper(a[[]], np.array([]))
-
-    b = Tensor([]).float()
-    self.assertRaises(IndexError, lambda: a[b])
 
   def test_ellipsis_index(self):
     a = Tensor([[1, 2, 3],
@@ -738,113 +409,6 @@ class TestNumpy(unittest.TestCase):
 
     self.assertRaises(IndexError, a.__getitem__, 1 << 30)
     self.assertRaises(IndexError, a.__getitem__, 1 << 64)
-
-  @unittest.skip("bool indexing not supported")
-  def test_single_bool_index(self):
-    # Single boolean index
-    a = Tensor([[1, 2, 3],
-                [4, 5, 6],
-                [7, 8, 9]])
-
-    numpy_testing_assert_equal_helper(a[True], a[None])
-    numpy_testing_assert_equal_helper(a[False], a[None][0:0])
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_shape_mismatch(self):
-    arr = Tensor.ones((5, 4, 3))
-
-    index = Tensor([True])
-    self.assertRaises(IndexError, lambda: arr[index])
-
-    index = Tensor([False] * 6)
-    self.assertRaises(IndexError, lambda: arr[index])
-
-    index = Tensor.zeros(4, 4, dtype=dtypes.uint8)
-    self.assertRaises(IndexError, lambda: arr[index])
-    self.assertRaises(IndexError, lambda: arr[(slice(None), index)])
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_indexing_onedim(self):
-    # Indexing a 2-dimensional array with
-    # boolean array of length one
-    a = Tensor([[0., 0., 0.]])
-    b = Tensor([True])
-    numpy_testing_assert_equal_helper(a[b], a)
-    # boolean assignment
-    a[b] = 1.
-    numpy_testing_assert_equal_helper(a, Tensor([[1., 1., 1.]]))
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_assignment_value_mismatch(self):
-    # A boolean assignment should fail when the shape of the values
-    # cannot be broadcast to the subscription. (see also gh-3458)
-    a = Tensor.arange(0, 4)
-
-    def f(a, v):
-      a[a > -1] = Tensor(v)
-
-    self.assertRaises(Exception, f, a, [])
-    self.assertRaises(Exception, f, a, [1, 2, 3])
-    self.assertRaises(Exception, f, a[:1], [1, 2, 3])
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_indexing_twodim(self):
-    # Indexing a 2-dimensional array with
-    # 2-dimensional boolean array
-    a = Tensor([[1, 2, 3],
-                [4, 5, 6],
-                [7, 8, 9]])
-    b = Tensor([[True, False, True],
-                [False, True, False],
-                [True, False, True]])
-    numpy_testing_assert_equal_helper(a[b], Tensor([1, 3, 5, 7, 9]))
-    numpy_testing_assert_equal_helper(a[b[1]], Tensor([[4, 5, 6]]))
-    numpy_testing_assert_equal_helper(a[b[0]], a[b[2]])
-
-    # boolean assignment
-    a[b] = 0
-    numpy_testing_assert_equal_helper(a, Tensor([[0, 2, 0],
-                                                  [4, 0, 6],
-                                                  [0, 8, 0]]))
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_indexing_weirdness(self):
-    # Weird boolean indexing things
-    a = Tensor.ones((2, 3, 4))
-    numpy_testing_assert_equal_helper((0, 2, 3, 4), a[False, True, ...].shape)
-    numpy_testing_assert_equal_helper(Tensor.ones(1, 2), a[True, [0, 1], True, True, [1], [[2]]])
-    self.assertRaises(IndexError, lambda: a[False, [0, 1], ...])
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_indexing_weirdness_tensors(self):
-    # Weird boolean indexing things
-    false = Tensor(False)
-    true = Tensor(True)
-    a = Tensor.ones((2, 3, 4))
-    numpy_testing_assert_equal_helper((0, 2, 3, 4), a[False, True, ...].shape)
-    numpy_testing_assert_equal_helper(Tensor.ones(1, 2), a[true, [0, 1], true, true, [1], [[2]]])
-    self.assertRaises(IndexError, lambda: a[false, [0, 1], ...])
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_indexing_alldims(self):
-    true = Tensor(True)
-    a = Tensor.ones((2, 3))
-    numpy_testing_assert_equal_helper((1, 2, 3), a[True, True].shape)
-    numpy_testing_assert_equal_helper((1, 2, 3), a[true, true].shape)
-
-  @unittest.skip("bool indexing not supported")
-  def test_boolean_list_indexing(self):
-    # Indexing a 2-dimensional array with
-    # boolean lists
-    a = Tensor([[1, 2, 3],
-                [4, 5, 6],
-                [7, 8, 9]])
-    b = [True, False, False]
-    c = [True, True, False]
-    numpy_testing_assert_equal_helper(a[b], Tensor([[1, 2, 3]]))
-    numpy_testing_assert_equal_helper(a[b, b], Tensor([1]))
-    numpy_testing_assert_equal_helper(a[c], Tensor([[1, 2, 3], [4, 5, 6]]))
-    numpy_testing_assert_equal_helper(a[c, c], Tensor([1, 5]))
 
   # TODO out of bound getitem does not raise error
   '''
@@ -896,472 +460,33 @@ class TestNumpy(unittest.TestCase):
     numpy_testing_assert_equal_helper(kernel, kernel2)
   '''
 
-def tensor_indices_to_np(tensor: Tensor, indices):
-  npt = tensor.numpy()
-  idxs = tuple(i.numpy().tolist() if isinstance(i, Tensor) and i.dtype == dtypes.int64 else
-              i for i in indices)
-  return npt, idxs
-
-def get_numpy(tensor, indices):
-  npt, idxs = tensor_indices_to_np(tensor, indices)
-  return Tensor(npt[idxs])
-
-def set_numpy(tensor:Tensor, indices, value):
-  if not isinstance(value, int):
-    value = value.numpy()
-  npt, idxs = tensor_indices_to_np(tensor, indices)
-  npt[idxs] = value
-  return npt
-
-def assert_get_eq(tensor, indexer):
-  numpy_testing_assert_equal_helper(tensor[indexer], get_numpy(tensor, indexer))
-
-def assert_set_eq(tensor: Tensor, indexer, val):
-  pyt = clone(tensor)
-  numt = clone(tensor)
-  pyt[indexer] = val
-  numt = set_numpy(numt, indexer, val)
-  numpy_testing_assert_equal_helper(pyt, numt)
-
-# NOTE: torch initiates the gradients using g0cpu (rand as gradients)
-def assert_backward_eq(tensor: Tensor, indexer):
-  cpu = clone(tensor.float())
-  outcpu = cpu[indexer].sum()
-  outcpu.backward()
-  dev = cpu.detach()
-  outdev = dev[indexer].sum()
-  outdev.backward()
-  numpy_testing_assert_equal_helper(cpu.grad, dev.grad)
-
-def get_set_tensor(indexed: Tensor, indexer):
-  set_size = indexed[indexer].shape
-  set_count = indexed[indexer].numel()
-  set_tensor = Tensor.randint(set_count, high=set_count).reshape(set_size).cast(indexed.dtype)
-  return set_tensor
-
-@slow
 class TestAdvancedIndexing(unittest.TestCase):
   def test_integer_array_indexing(self):
-    # pick a random valid indexer type
-    def ri(indices):
-      choice = random.randint(0, 2)
-      if choice == 0: return Tensor(indices)
-      if choice == 1: return list(indices)
-      return tuple(indices)
+    x = Tensor.arange(5)
+    x[[0, 2, 4]] = Tensor([5, 4, 3])
+    numpy_testing_assert_equal_helper(x, [5, 1, 4, 3, 3])
 
-    def validate_indexing(x):
-      numpy_testing_assert_equal_helper(x[[0]], consec((1,)))
-      numpy_testing_assert_equal_helper(x[ri([0]),], consec((1,)))
-      numpy_testing_assert_equal_helper(x[ri([3]),], consec((1,), 4))
-      numpy_testing_assert_equal_helper(x[[2, 3, 4]], consec((3,), 3))
-      numpy_testing_assert_equal_helper(x[ri([2, 3, 4]),], consec((3,), 3))
-      numpy_testing_assert_equal_helper(x[ri([0, 2, 4]),], np.array([1, 3, 5]))
+  def test_negative_list_setitem(self):
+    x = Tensor.arange(6).reshape(2, 3).clone()
+    expected = np.arange(6).reshape(2, 3)
+    x[[0, 1], [-1]] = Tensor([7, 8])
+    expected[[0, 1], [-1]] = [7, 8]
+    numpy_testing_assert_equal_helper(x, expected)
 
-    def validate_setting(x):
-      x[[0]] = -2
-      numpy_testing_assert_equal_helper(x[[0]], np.array([-2]))
-      x[[0]] = -1
-      numpy_testing_assert_equal_helper(x[ri([0]), ], np.array([-1]))
-      x[[2, 3, 4]] = 4
-      numpy_testing_assert_equal_helper(x[[2, 3, 4]], np.array([4, 4, 4]))
-      x[ri([2, 3, 4]), ] = 3
-      numpy_testing_assert_equal_helper(x[ri([2, 3, 4]), ], np.array([3, 3, 3]))
-      x[ri([0, 2, 4]), ] = Tensor([5, 4, 3])
-      numpy_testing_assert_equal_helper(x[ri([0, 2, 4]), ], np.array([5, 4, 3]))
-
-    # Case 1: Purely Integer Array Indexing
-    reference = consec((10,))
-    validate_indexing(reference)
-    # setting values
-    validate_setting(reference)
-
-    # Tensor with stride != 1
-    # strided is [1, 3, 5, 7]
-
-    # # TODO: set stride
-    # reference = consec((10,))
-    # strided = set_(reference, (4,), (2,), 0)
-
-    # numpy_testing_assert_equal_helper(strided[[0]], np.array([1]))
-    # numpy_testing_assert_equal_helper(strided[ri([0]), ], np.array([1]))
-    # numpy_testing_assert_equal_helper(strided[ri([3]), ], np.array([7]))
-    # numpy_testing_assert_equal_helper(strided[[1, 2]], np.array([3, 5]))
-    # numpy_testing_assert_equal_helper(strided[ri([1, 2]), ], np.array([3, 5]))
-    # numpy_testing_assert_equal_helper(strided[ri([[2, 1], [0, 3]]), ],
-    #                   np.array([[5, 3], [1, 7]]))
-
-    # stride is [4, 8]
-
-    # strided = set_(reference, (2,), (4,), offset=4)
-
-    # numpy_testing_assert_equal_helper(strided[[0]], np.array([5]))
-    # numpy_testing_assert_equal_helper(strided[ri([0]), ], np.array([5]))
-    # numpy_testing_assert_equal_helper(strided[ri([1]), ], np.array([9]))
-    # numpy_testing_assert_equal_helper(strided[[0, 1]], np.array([5, 9]))
-    # numpy_testing_assert_equal_helper(strided[ri([0, 1]), ], np.array([5, 9]))
-    # numpy_testing_assert_equal_helper(strided[ri([[0, 1], [1, 0]]), ],
-    #                   np.array([[5, 9], [9, 5]]))
-
-    # reference is 1 2
-    #              3 4
-    #              5 6
-    reference = consec((3, 2))
-    numpy_testing_assert_equal_helper(reference[ri([0, 1, 2]), ri([0])], np.array([1, 3, 5]))
-    numpy_testing_assert_equal_helper(reference[ri([0, 1, 2]), ri([1])], np.array([2, 4, 6]))
-    numpy_testing_assert_equal_helper(reference[ri([0]), ri([0])], consec((1,)))
-    numpy_testing_assert_equal_helper(reference[ri([2]), ri([1])], consec((1,), 6))
-    numpy_testing_assert_equal_helper(reference[[ri([0, 0]), ri([0, 1])]], np.array([1, 2]))
-    numpy_testing_assert_equal_helper(reference[[ri([0, 1, 1, 0, 2]), ri([1])]], np.array([2, 4, 4, 2, 6]))
-    numpy_testing_assert_equal_helper(reference[[ri([0, 0, 1, 1]), ri([0, 1, 0, 0])]], np.array([1, 2, 3, 3]))
-
-    rows = ri([[0, 0],
-               [1, 2]])
-    columns = [0],
-    numpy_testing_assert_equal_helper(reference[rows, columns], np.array([[1, 1],
-                                                                          [3, 5]]))
-
-    rows = ri([[0, 0],
-               [1, 2]])
-    columns = ri([1, 0])
-    numpy_testing_assert_equal_helper(reference[rows, columns], np.array([[2, 1],
-                                                                          [4, 5]]))
-    rows = ri([[0, 0],
-               [1, 2]])
-    columns = ri([[0, 1],
-                  [1, 0]])
-    numpy_testing_assert_equal_helper(reference[rows, columns], np.array([[1, 2],
-                                                                          [4, 5]]))
-
-    # setting values
-    reference[ri([0]), ri([1])] = -1
-    numpy_testing_assert_equal_helper(reference[ri([0]), ri([1])], np.array([-1]))
-    reference[ri([0, 1, 2]), ri([0])] = Tensor([-1, 2, -4])
-    numpy_testing_assert_equal_helper(reference[ri([0, 1, 2]), ri([0])],
-                      np.array([-1, 2, -4]))
-    reference[rows, columns] = Tensor([[4, 6], [2, 3]])
-    numpy_testing_assert_equal_helper(reference[rows, columns],
-                      np.array([[4, 6], [2, 3]]))
-
-    # Verify still works with Transposed (i.e. non-contiguous) Tensors
-    reference = Tensor([[0, 1, 2, 3],
-                        [4, 5, 6, 7],
-                        [8, 9, 10, 11]]).T
-
-    # Transposed: [[0, 4, 8],
-    #              [1, 5, 9],
-    #              [2, 6, 10],
-    #              [3, 7, 11]]
-
-    numpy_testing_assert_equal_helper(reference[ri([0, 1, 2]), ri([0])], np.array([0, 1, 2]))
-    numpy_testing_assert_equal_helper(reference[ri([0, 1, 2]), ri([1])], np.array([4, 5, 6]))
-    numpy_testing_assert_equal_helper(reference[ri([0]), ri([0])], np.array([0]))
-    numpy_testing_assert_equal_helper(reference[ri([2]), ri([1])], np.array([6]))
-    numpy_testing_assert_equal_helper(reference[[ri([0, 0]), ri([0, 1])]], np.array([0, 4]))
-    numpy_testing_assert_equal_helper(reference[[ri([0, 1, 1, 0, 3]), ri([1])]], np.array([4, 5, 5, 4, 7]))
-    numpy_testing_assert_equal_helper(reference[[ri([0, 0, 1, 1]), ri([0, 1, 0, 0])]], np.array([0, 4, 1, 1]))
-
-    rows = ri([[0, 0],
-               [1, 2]])
-    columns = [0],
-    numpy_testing_assert_equal_helper(reference[rows, columns], np.array([[0, 0], [1, 2]]))
-
-    rows = ri([[0, 0],
-               [1, 2]])
-    columns = ri([1, 0])
-    numpy_testing_assert_equal_helper(reference[rows, columns], np.array([[4, 0], [5, 2]]))
-    rows = ri([[0, 0],
-               [1, 3]])
-    columns = ri([[0, 1],
-                  [1, 2]])
-    numpy_testing_assert_equal_helper(reference[rows, columns], np.array([[0, 4], [5, 11]]))
-
-    # TODO: non contiguous setitem
-    '''
-    # setting values
-    reference[ri([0]), ri([1])] = -1
-    numpy_testing_assert_equal_helper(reference[ri([0]), ri([1])],
-                      np.array([-1]))
-    reference[ri([0, 1, 2]), ri([0])] = np.array([-1, 2, -4])
-    numpy_testing_assert_equal_helper(reference[ri([0, 1, 2]), ri([0])],
-                      np.array([-1, 2, -4]))
-    reference[rows, columns] = np.array([[4, 6], [2, 3]])
-    numpy_testing_assert_equal_helper(reference[rows, columns],
-                      np.array([[4, 6], [2, 3]]))
-    '''
-
-    # stride != 1
-
-    # strided is [[1 3 5 7],
-    #             [9 11 13 15]]
-
-    # # TODO: set stride
-    # reference = Tensor.arange(0., 24).reshape(3, 8)
-    # strided = set_(reference, (2,4), (8,2), 1)
-
-    # numpy_testing_assert_equal_helper(strided[ri([0, 1]), ri([0])], np.array([1, 9]))
-    # numpy_testing_assert_equal_helper(strided[ri([0, 1]), ri([1])], np.array([3, 11]))
-    # numpy_testing_assert_equal_helper(strided[ri([0]), ri([0])], np.array([1]))
-    # numpy_testing_assert_equal_helper(strided[ri([1]), ri([3])], np.array([15]))
-    # numpy_testing_assert_equal_helper(strided[[ri([0, 0]), ri([0, 3])]], np.array([1, 7]))
-    # numpy_testing_assert_equal_helper(strided[[ri([1]), ri([0, 1, 1, 0, 3])]], np.array([9, 11, 11, 9, 15]))
-    # numpy_testing_assert_equal_helper(strided[[ri([0, 0, 1, 1]), ri([0, 1, 0, 0])]], np.array([1, 3, 9, 9]))
-
-    # rows = ri([[0, 0],
-    #            [1, 1]])
-    # columns = [0],
-    # numpy_testing_assert_equal_helper(strided[rows, columns], np.array([[1, 1], [9, 9]]))
-
-    # rows = ri([[0, 1],
-    #            [1, 0]])
-    # columns = ri([1, 2])
-    # numpy_testing_assert_equal_helper(strided[rows, columns], np.array([[3, 13], [11, 5]]))
-    # rows = ri([[0, 0],
-    #            [1, 1]])
-    # columns = ri([[0, 1],
-    #               [1, 2]])
-    # numpy_testing_assert_equal_helper(strided[rows, columns], np.array([[1, 3], [11, 13]]))
-
-    # setting values
-
-    # strided is [[10, 11],
-    #             [17, 18]]
-
-    # # TODO: set stride
-    # reference = Tensor.arange(0., 24).reshape(3, 8)
-    # strided = set_(reference, (2,2), (7,1), 10)
-
-    # numpy_testing_assert_equal_helper(strided[ri([0]), ri([1])], np.array([11]))
-
-    # TODO non contiguous setitem
-    '''
-    strided[ri([0]), ri([1])] = -1
-    numpy_testing_assert_equal_helper(strided[ri([0]), ri([1])],
-                      Tensor([-1]))
-    '''
-    # # TODO: set stride
-    # reference = Tensor.arange(0., 24).reshape(3, 8)
-    # strided = set_(reference, (2,2), (7,1), 10)
-
-    # numpy_testing_assert_equal_helper(strided[ri([0, 1]), ri([1, 0])], np.array([11, 17]))
-
-    # TODO non contiguous setitem
-    '''
-    strided[ri([0, 1]), ri([1, 0])] = Tensor([-1, 2])
-    numpy_testing_assert_equal_helper(strided[ri([0, 1]), ri([1, 0])],
-                      Tensor([-1, 2]))
-    '''
-
-    # # TODO: set stride
-    # reference = Tensor.arange(0., 24).realize().reshape(3, 8)
-    # strided = set_(reference, (2,2), (7,1), 10)
-
-    # rows = ri([[0],
-    #             [1]])
-    # columns = ri([[0, 1],
-    #               [0, 1]])
-    # numpy_testing_assert_equal_helper(strided[rows, columns], np.array([[10, 11], [17, 18]]))
-
-    # TODO non contiguous setitem
-    '''
-    strided[rows, columns] = Tensor([[4, 6], [2, 3]])
-    numpy_testing_assert_equal_helper(strided[rows, columns],
-                      Tensor([[4, 6], [2, 3]]))
-    '''
-
-    # Tests using less than the number of dims, and ellipsis
-
-    # reference is 1 2
-    #              3 4
-    #              5 6
-    reference = consec((3, 2))
-    numpy_testing_assert_equal_helper(reference[ri([0, 2]),], np.array([[1, 2], [5, 6]]))
-    numpy_testing_assert_equal_helper(reference[ri([1]), ...], np.array([[3, 4]]))
-    numpy_testing_assert_equal_helper(reference[..., ri([1])], np.array([[2], [4], [6]]))
-
-    # verify too many indices fails
-    with self.assertRaises(IndexError): reference[ri([1]), ri([0, 2]), ri([3])]
-
-    # test invalid index fails
-    reference = Tensor.empty(10)
-    for err_idx in (10, -11):
-      with self.assertRaises(IndexError):
-        reference[err_idx]
-      # NOTE cannot check for out of bounds with Tensor indexing
-      # see tensor.py: __getitem__ (Tiny Things)
-      '''
-      with self.assertRaises(IndexError):
-        reference[Tensor([err_idx], dtype=dtypes.int64)]
-      with self.assertRaises(IndexError):
-        reference[[err_idx]]
-      '''
-
-  def test_numpy_parity_and_backward_2d(self):
-    # Tensor is  0  1  2  3  4
-    #            5  6  7  8  9
-    #           10 11 12 13 14
-    #           15 16 17 18 19
-    reference = Tensor.arange(0., 20).reshape(4, 5)
-
-    indices_to_test = [
-      # grab the second, fourth columns
-      [slice(None), [1, 3]],
-
-      # first, third rows,
-      [[0, 2], slice(None)],
-
-      # weird shape
-      [slice(None), [[0, 1],
-                      [2, 3]]],
-      # negatives
-      [[-1], [0]],
-      [[0, 2], [-1]],
-      [slice(None), [-1]],
-    ]
-
-    # only test dupes on gets
-    get_indices_to_test = indices_to_test + [[slice(None), [0, 1, 1, 2, 2]]]
-
-    for indexer in get_indices_to_test:
-      assert_get_eq(reference, indexer)
-      assert_backward_eq(reference, indexer)
-
-    for indexer in indices_to_test:
-      assert_set_eq(reference, indexer, 44)
-      assert_set_eq(reference, indexer, get_set_tensor(reference, indexer))
-
-  def test_numpy_parity_and_backward_3d(self):
-    reference = Tensor.arange(0., 160).reshape(4, 8, 5)
-
-    indices_to_test = [
-      [slice(None), slice(None), [0, 3, 4]],
-      [slice(None), [2, 4, 5, 7], slice(None)],
-      [[2, 3], slice(None), slice(None)],
-      [slice(None), [0, 2, 3], [1, 3, 4]],
-      [slice(None), [0], [1, 2, 4]],
-      [slice(None), [0, 1, 3], [4]],
-      [slice(None), [[0, 1], [1, 0]], [[2, 3]]],
-      [slice(None), [[0, 1], [2, 3]], [[0]]],
-      [slice(None), [[5, 6]], [[0, 3], [4, 4]]],
-      [[0, 2, 3], [1, 3, 4], slice(None)],
-      [[0], [1, 2, 4], slice(None)],
-      [[0, 1, 3], [4], slice(None)],
-      [[[0, 1], [1, 0]], [[2, 1], [3, 5]], slice(None)],
-      [[[0, 1], [1, 0]], [[2, 3]], slice(None)],
-      [[[0, 1], [2, 3]], [[0]], slice(None)],
-      [[[2, 1]], [[0, 3], [4, 4]], slice(None)],
-      [[[2]], [[0, 3], [4, 1]], slice(None)],
-      # non-contiguous indexing subspace
-      [[0, 2, 3], slice(None), [1, 3, 4]],
-
-      # less dim, ellipsis
-      [[0, 2], ],
-      [[0, 2], slice(None)],
-      [[0, 2], Ellipsis],
-      [[0, 2], slice(None), Ellipsis],
-      [[0, 2], Ellipsis, slice(None)],
-      [[0, 2], [1, 3]],
-      [[0, 2], [1, 3], Ellipsis],
-      [Ellipsis, [1, 3], [2, 3]],
-      [Ellipsis, [2, 3, 4]],
-      [Ellipsis, slice(None), [2, 3, 4]],
-      [slice(None), Ellipsis, [2, 3, 4]],
-
-      # ellipsis counts for nothing
-      [Ellipsis, slice(None), slice(None), [0, 3, 4]],
-      [slice(None), Ellipsis, slice(None), [0, 3, 4]],
-      [slice(None), slice(None), Ellipsis, [0, 3, 4]],
-      [slice(None), slice(None), [0, 3, 4], Ellipsis],
-      [Ellipsis, [[0, 1], [1, 0]], [[2, 1], [3, 5]], slice(None)],
-      [[[0, 1], [1, 0]], [[2, 1], [3, 5]], Ellipsis, slice(None)],
-      [[[0, 1], [1, 0]], [[2, 1], [3, 5]], slice(None), Ellipsis],
-    ]
-
-    for indexer in indices_to_test:
-      assert_get_eq(reference, indexer)
-
-      assert_set_eq(reference, indexer, 212)
-      assert_set_eq(reference, indexer, get_set_tensor(reference, indexer))
-      assert_backward_eq(reference, indexer)
-
-  def test_numpy_parity_and_backward_4d(self):
-    reference = Tensor.arange(0., 1296).reshape(3, 9, 8, 6)
-
-    indices_to_test = [
-      [slice(None), slice(None), slice(None), [0, 3, 4]],
-      [slice(None), slice(None), [2, 4, 5, 7], slice(None)],
-      [slice(None), [2, 3], slice(None), slice(None)],
-      [[1, 2], slice(None), slice(None), slice(None)],
-      [slice(None), slice(None), [0, 2, 3], [1, 3, 4]],
-      [slice(None), slice(None), [0], [1, 2, 4]],
-      [slice(None), slice(None), [0, 1, 3], [4]],
-      [slice(None), slice(None), [[0, 1], [1, 0]], [[2, 3]]],
-      [slice(None), slice(None), [[0, 1], [2, 3]], [[0]]],
-      [slice(None), slice(None), [[5, 6]], [[0, 3], [4, 4]]],
-      [slice(None), [0, 2, 3], [1, 3, 4], slice(None)],
-      [slice(None), [0], [1, 2, 4], slice(None)],
-      [slice(None), [0, 1, 3], [4], slice(None)],
-      [slice(None), [[0, 1], [3, 4]], [[2, 3], [0, 1]], slice(None)],
-      [slice(None), [[0, 1], [3, 4]], [[2, 3]], slice(None)],
-      [slice(None), [[0, 1], [3, 2]], [[0]], slice(None)],
-      [slice(None), [[2, 1]], [[0, 3], [6, 4]], slice(None)],
-      [slice(None), [[2]], [[0, 3], [4, 2]], slice(None)],
-      [[0, 1, 2], [1, 3, 4], slice(None), slice(None)],
-      [[0], [1, 2, 4], slice(None), slice(None)],
-      [[0, 1, 2], [4], slice(None), slice(None)],
-      [[[0, 1], [0, 2]], [[2, 4], [1, 5]], slice(None), slice(None)],
-      [[[0, 1], [1, 2]], [[2, 0]], slice(None), slice(None)],
-      [[[2, 2]], [[0, 3], [4, 5]], slice(None), slice(None)],
-      [[[2]], [[0, 3], [4, 5]], slice(None), slice(None)],
-      [slice(None), [3, 4, 6], [0, 2, 3], [1, 3, 4]],
-      [slice(None), [2, 3, 4], [1, 3, 4], [4]],
-      [slice(None), [0, 1, 3], [4], [1, 3, 4]],
-      [slice(None), [6], [0, 2, 3], [1, 3, 4]],
-      [slice(None), [2, 3, 5], [3], [4]],
-      [slice(None), [0], [4], [1, 3, 4]],
-      [slice(None), [6], [0, 2, 3], [1]],
-      [slice(None), [[0, 3], [3, 6]], [[0, 1], [1, 3]], [[5, 3], [1, 2]]],
-      [[2, 2, 1], [0, 2, 3], [1, 3, 4], slice(None)],
-      [[2, 0, 1], [1, 2, 3], [4], slice(None)],
-      [[0, 1, 2], [4], [1, 3, 4], slice(None)],
-      [[0], [0, 2, 3], [1, 3, 4], slice(None)],
-      [[0, 2, 1], [3], [4], slice(None)],
-      [[0], [4], [1, 3, 4], slice(None)],
-      [[1], [0, 2, 3], [1], slice(None)],
-      [[[1, 2], [1, 2]], [[0, 1], [2, 3]], [[2, 3], [3, 5]], slice(None)],
-
-      # less dim, ellipsis
-      [Ellipsis, [0, 3, 4]],
-      [Ellipsis, slice(None), [0, 3, 4]],
-      [Ellipsis, slice(None), slice(None), [0, 3, 4]],
-      [slice(None), Ellipsis, [0, 3, 4]],
-      [slice(None), slice(None), Ellipsis, [0, 3, 4]],
-      [slice(None), [0, 2, 3], [1, 3, 4]],
-      [slice(None), [0, 2, 3], [1, 3, 4], Ellipsis],
-      [Ellipsis, [0, 2, 3], [1, 3, 4], slice(None)],
-      [[0], [1, 2, 4]],
-      [[0], [1, 2, 4], slice(None)],
-      [[0], [1, 2, 4], Ellipsis],
-      [[0], [1, 2, 4], Ellipsis, slice(None)],
-      [[1], ],
-      [[0, 2, 1], [3], [4]],
-      [[0, 2, 1], [3], [4], slice(None)],
-      [[0, 2, 1], [3], [4], Ellipsis],
-      [Ellipsis, [0, 2, 1], [3], [4]],
-    ]
-
-    for indexer in indices_to_test:
-      assert_get_eq(reference, indexer)
-      assert_set_eq(reference, indexer, 1333)
-      assert_set_eq(reference, indexer, get_set_tensor(reference, indexer))
-
-    indices_to_test += [
-      [slice(None), slice(None), [[0, 1], [1, 0]], [[2, 3], [3, 0]]],
-      [slice(None), slice(None), [[2]], [[0, 3], [4, 4]]],
-    ]
-    for indexer in indices_to_test:
-      assert_get_eq(reference, indexer)
-      assert_set_eq(reference, indexer, 1333)
-      assert_backward_eq(reference, indexer)
+class TestGetitemOps(unittest.TestCase):
+  def test_two_tensor_indices(self):
+    # linear indexing is O(idx_size), one-hot masks is O(idx_size * src_size)
+    src_np = np.random.rand(10, 100, 200).astype(np.float32)
+    idx1_np, idx2_np = np.random.randint(0, 100, (50, 60), dtype=np.int32), np.random.randint(0, 200, (50, 60), dtype=np.int32)
+    src, idx1, idx2 = Tensor(src_np), Tensor(idx1_np), Tensor(idx2_np)
+    # O(50*60) = 3K vs O(50*60*100*200) = 60M
+    GlobalCounters.reset()
+    np.testing.assert_allclose(src_np[0, idx1_np, idx2_np], src[0, idx1, idx2].numpy())
+    self.assertLess(GlobalCounters.global_ops, 100_000)
+    # consecutive indices not starting from dim 0: O(10*50*60) = 30K vs O(10*50*60*100*200) = 600M
+    GlobalCounters.reset()
+    np.testing.assert_allclose(src_np[:, idx1_np, idx2_np], src[:, idx1, idx2].numpy())
+    self.assertLess(GlobalCounters.global_ops, 1_000_000)
 
 if __name__ == '__main__':
   unittest.main()

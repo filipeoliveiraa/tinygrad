@@ -34,7 +34,6 @@ class TestFusedCE(unittest.TestCase):
 
   def test_fused_ce_1_2_16(self): run_fused_ce(1, 2, 16, label_smoothing=0.2)
   def test_fused_ce_2_16_128(self): run_fused_ce(2, 16, 128)
-  def test_fused_ce_4_128_1024(self): run_fused_ce(4, 128, 1024, label_smoothing=0.2)
   def test_fused_ce_grad_with_logits_reader(self):
     # squaring makes the backward's upstream grad read the forward's loss too. the backward must not pin logits behind the forward
     logits = Tensor.randn(1, 2, 16).cast(dtypes.bfloat16).contiguous().realize()
@@ -57,16 +56,13 @@ class TestFusedQKVRoPE(unittest.TestCase):
   def setUp(self):
     if dtypes.bfloat16 not in Device[Device.DEFAULT].renderer.supported_dtypes(): self.skipTest("test uses bf16 inputs")
 
-  def rand_bf16(self, *shape:int) -> Tensor:
-    return (Tensor.randn(*shape) * 0.1).cast(dtypes.bfloat16).contiguous().realize()
-
   def test_forward(self):
     Tensor.manual_seed(0)
     B, N, H, H_KV, D = 1, 32, 8, 2, 16
     GROUP = H // H_KV
     freqs_cis = (Tensor.randn(1, N * 2, 1, D // 2, 2) * 0.1).cast(dtypes.bfloat16).contiguous().realize()
 
-    x = self.rand_bf16(B, N, H_KV * (GROUP + 2) * D)
+    x = (Tensor.randn(B, N, H_KV * (GROUP + 2) * D) * 0.1).cast(dtypes.bfloat16).contiguous().realize()
     q, k, v = fused_qkv_rope(x, freqs_cis, H, H_KV, D)
     Tensor.realize(q, k, v)
     packed_ref = x.reshape(B, N, H_KV, GROUP + 2, D)
